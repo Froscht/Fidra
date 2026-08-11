@@ -388,9 +388,10 @@ void AnalysisWorker::LoadPe(const QByteArray& Data) {
         if (Seg.Name == ".rsrc") Seg.Type = SegmentType::Resource;
         if (Seg.Name == ".reloc") Seg.Type = SegmentType::Reloc;
 
-        if (PointerToRawData > 0 && SizeOfRawData > 0 &&
-            PointerToRawData + SizeOfRawData <= FileSize) {
-            Seg.Data = Data.mid(static_cast<int>(PointerToRawData), static_cast<int>(SizeOfRawData));
+        if (PointerToRawData > 0 && SizeOfRawData > 0 && PointerToRawData < FileSize) {
+            size_t Available = FileSize - PointerToRawData;
+            size_t ToRead = std::min(static_cast<size_t>(SizeOfRawData), Available);
+            Seg.Data = Data.mid(static_cast<qsizetype>(PointerToRawData), static_cast<qsizetype>(ToRead));
             if (static_cast<size_t>(Seg.Data.size()) < Seg.VirtualSize) {
                 Seg.Data.append(QByteArray(static_cast<int>(Seg.VirtualSize - Seg.Data.size()), '\0'));
             }
@@ -2193,6 +2194,13 @@ void AnalysisWorker::RunLinearSweep() {
         return;
     }
 
+    constexpr int MaxLinearSweepTargets = 200000;
+    if (ProloguesFound > MaxLinearSweepTargets) {
+        emit LogMessage(QString("Linear sweep: capping from %1 to %2 targets").arg(ProloguesFound).arg(MaxLinearSweepTargets));
+        NewTargets.resize(MaxLinearSweepTargets);
+        ProloguesFound = MaxLinearSweepTargets;
+    }
+
     emit LogMessage(QString("Linear sweep: found %1 new function prologues, disassembling...").arg(ProloguesFound));
 
     {
@@ -2206,14 +2214,19 @@ void AnalysisWorker::RunLinearSweep() {
     if (NumThreads < 2) NumThreads = 2;
     if (NumThreads > 16) NumThreads = 16;
 
+    QAtomicInt FuncsProcessed(0);
+    int TotalTargets = ProloguesFound;
+
     QList<QFuture<void>> Futures;
 
     for (int T = 0; T < NumThreads; ++T) {
-        QFuture<void> Future = QtConcurrent::run([this, CsArch, CsMode]() {
+        QFuture<void> Future = QtConcurrent::run([this, CsArch, CsMode, &FuncsProcessed, TotalTargets]() {
             QThread::currentThread()->setPriority(QThread::LowPriority);
             csh Handle;
             if (cs_open(CsArch, CsMode, &Handle) != CS_ERR_OK) return;
             cs_option(Handle, CS_OPT_DETAIL, CS_OPT_ON);
+
+            int IdleCount = 0;
 
             while (!Cancelled.loadRelaxed()) {
                 Address Target = 0;
@@ -2227,13 +2240,24 @@ void AnalysisWorker::RunLinearSweep() {
                 }
 
                 if (Target == 0) {
+                    if (++IdleCount > 50) {
+                        QMutexLocker Locker(&QueueMutex);
+                        if (QueueMT.isEmpty()) break;
+                    }
                     QThread::msleep(1);
-                    QMutexLocker Locker(&QueueMutex);
-                    if (QueueMT.isEmpty()) break;
                     continue;
                 }
 
+                IdleCount = 0;
                 DisassembleFromMT(Target, static_cast<size_t>(Handle));
+
+                int Done = FuncsProcessed.fetchAndAddRelaxed(1) + 1;
+                if (Done % 5000 == 0) {
+                    int Pct = 25 + std::min(4, Done * 5 / std::max(1, TotalTargets));
+                    EmitProgress(AnalysisState::Disassembling, Pct,
+                        QString("Linear sweep: %1/%2 functions disassembled, %3 instructions")
+                            .arg(Done).arg(TotalTargets).arg(Db->InstructionCount()));
+                }
             }
 
             cs_close(&Handle);
