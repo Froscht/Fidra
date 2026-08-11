@@ -22,6 +22,7 @@ public:
 
     void DecompileFunction(Address Addr, AnalysisDatabase* Db);
     void SetDatabase(AnalysisDatabase* Db);
+    void NavigateToAddress(Address Addr);
 
 signals:
     void StatusMessage(const QString& Msg);

@@ -2,6 +2,7 @@
 #include "DecompilerWidget.h"
 #include <QStyle>
 #include <QApplication>
+#include <QTabWidget>
 
 namespace Fidra {
 
@@ -42,6 +43,22 @@ QList<QPair<QString, QWidget*>> DecompilerModule::CreateDockWidgets(QWidget* Par
 
 void DecompilerModule::Initialize(ICore* Core) {
     CoreRef = Core;
+
+    CoreRef->OnFunctionNavigated([this](Address Addr) {
+        if (MainWidget) {
+            MainWidget->NavigateToAddress(Addr);
+            QWidget* Parent = MainWidget->parentWidget();
+            while (Parent) {
+                auto* Tabs = qobject_cast<QTabWidget*>(Parent);
+                if (Tabs) {
+                    Tabs->setCurrentWidget(MainWidget);
+                    break;
+                }
+                Parent = Parent->parentWidget();
+            }
+        }
+    });
+
     CoreRef->Log(QStringLiteral("Decompiler module initialized"));
 }
 

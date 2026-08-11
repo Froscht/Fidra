@@ -76,7 +76,9 @@ QList<QPair<QString, QWidget*>> DisasmModule::CreateDockWidgets(QWidget* Parent)
 
 void DisasmModule::Initialize(ICore* Core) {
     CoreRef = Core;
+}
 
+void DisasmModule::PostInitialize(ICore* Core) {
     if (MainDisasm) {
         MainDisasm->SetCore(Core);
     }
@@ -89,6 +91,12 @@ void DisasmModule::Initialize(ICore* Core) {
 
     if (FuncList && MainDisasm) {
         connect(FuncList, &FunctionList::FunctionSelected, MainDisasm, &DisasmWidget::NavigateTo);
+    }
+
+    if (FuncList && CoreRef) {
+        connect(FuncList, &FunctionList::FunctionSelected, [this](Address Addr) {
+            CoreRef->NavigateToFunction(Addr);
+        });
     }
 
     if (GraphView && MainDisasm) {
@@ -106,6 +114,12 @@ void DisasmModule::Initialize(ICore* Core) {
     if (SegmentView && MainDisasm) {
         connect(SegmentView, &SegmentWidget::NavigateToAddress, MainDisasm, &DisasmWidget::NavigateTo);
     }
+
+    CoreRef->OnAnalysisStarted([this](AnalysisDatabase* Db) {
+        if (FuncList) {
+            FuncList->ConnectToDatabase(Db);
+        }
+    });
 }
 
 void DisasmModule::Shutdown() {

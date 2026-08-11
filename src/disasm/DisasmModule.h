@@ -29,6 +29,7 @@ public:
     QList<QPair<QString, QWidget*>> CreateDockWidgets(QWidget* Parent) override;
 
     void Initialize(ICore* Core) override;
+    void PostInitialize(ICore* Core) override;
     void Shutdown() override;
 
     void OnProcessAttached(const ProcessInfo& Info) override;

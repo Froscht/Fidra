@@ -67,6 +67,14 @@ void FunctionTableModel::SetFunctions(QList<FunctionEntry>&& Funcs) {
     endResetModel();
 }
 
+void FunctionTableModel::AppendFunctions(const QList<FunctionEntry>& Funcs) {
+    if (Funcs.isEmpty()) return;
+    int First = Functions.size();
+    beginInsertRows(QModelIndex(), First, First + Funcs.size() - 1);
+    Functions.append(Funcs);
+    endInsertRows();
+}
+
 void FunctionTableModel::Clear() {
     beginResetModel();
     Functions.clear();
@@ -82,6 +90,9 @@ Address FunctionTableModel::AddressAt(int Row) const {
 FunctionList::FunctionList(QWidget* Parent)
     : QWidget(Parent)
     , CorePtr(nullptr)
+    , LiveDb(nullptr)
+    , BatchTimer(nullptr)
+    , LastKnownCount(0)
 {
     auto* Layout = new QVBoxLayout(this);
     Layout->setContentsMargins(0, 0, 0, 0);
@@ -274,6 +285,58 @@ void FunctionList::LoadFromAnalysisDatabase(AnalysisDatabase* Db) {
         });
 
     Model->SetFunctions(std::move(Entries));
+}
+
+void FunctionList::ConnectToDatabase(AnalysisDatabase* Db) {
+    if (LiveDb) {
+        disconnect(LiveDb, nullptr, this, nullptr);
+    }
+    LiveDb = Db;
+    LastKnownCount = 0;
+    PendingEntries.clear();
+
+    if (!BatchTimer) {
+        BatchTimer = new QTimer(this);
+        BatchTimer->setSingleShot(true);
+        connect(BatchTimer, &QTimer::timeout, this, &FunctionList::FlushPending);
+    }
+
+    if (LiveDb) {
+        connect(LiveDb, &AnalysisDatabase::FunctionAdded, this, [this](Address, const QString&) {
+            if (!BatchTimer->isActive()) {
+                BatchTimer->start(500);
+            }
+        }, Qt::QueuedConnection);
+    }
+}
+
+void FunctionList::FlushPending() {
+    if (!LiveDb) return;
+
+    int CurrentCount = LiveDb->FunctionCount();
+    if (CurrentCount <= LastKnownCount) return;
+
+    QList<AnalyzedFunction> AllFuncs = LiveDb->GetAllFunctions();
+
+    QList<FunctionEntry> NewEntries;
+    NewEntries.reserve(AllFuncs.size() - LastKnownCount);
+
+    int Skip = LastKnownCount;
+    for (const auto& Af : AllFuncs) {
+        if (Skip > 0) { --Skip; continue; }
+        FunctionEntry Entry;
+        Entry.StartAddress = Af.Start;
+        Entry.EndAddress = Af.End;
+        Entry.Name = Af.Name;
+        Entry.Size = Af.Size;
+        NewEntries.append(Entry);
+    }
+
+    LastKnownCount = CurrentCount;
+
+    if (!NewEntries.isEmpty()) {
+        Model->AppendFunctions(NewEntries);
+    }
 }
 
 void FunctionList::OnFilterChanged(const QString& Text) {

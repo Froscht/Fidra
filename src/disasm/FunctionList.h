@@ -7,6 +7,7 @@
 #include <QList>
 #include <QAbstractTableModel>
 #include <QSortFilterProxyModel>
+#include <QTimer>
 
 namespace Fidra {
 
@@ -35,6 +36,7 @@ public:
     QVariant headerData(int Section, Qt::Orientation Orientation, int Role = Qt::DisplayRole) const override;
 
     void SetFunctions(QList<FunctionEntry>&& Funcs);
+    void AppendFunctions(const QList<FunctionEntry>& Funcs);
     void Clear();
     Address AddressAt(int Row) const;
 
@@ -54,6 +56,7 @@ public:
     void OnProcessDetached();
     void AnalyzeFunctions(Address StartAddr, size_t Size);
     void LoadFromAnalysisDatabase(AnalysisDatabase* Db);
+    void ConnectToDatabase(AnalysisDatabase* Db);
 
 signals:
     void FunctionSelected(Address Addr);
@@ -71,6 +74,13 @@ private:
     FunctionTableModel* Model;
     QSortFilterProxyModel* ProxyModel;
     QList<FunctionEntry> Functions;
+
+    AnalysisDatabase* LiveDb;
+    QTimer* BatchTimer;
+    QList<FunctionEntry> PendingEntries;
+    int LastKnownCount;
+
+    void FlushPending();
 };
 
 }

@@ -175,6 +175,15 @@ void DecompilerWidget::SetDatabase(AnalysisDatabase* Db) {
     DbRef = Db;
 }
 
+void DecompilerWidget::NavigateToAddress(Address Addr) {
+    if (DbRef) {
+        DecompileFunction(Addr, DbRef);
+    } else {
+        CurrentAddr = Addr;
+        StatusLabel->setText(QString("Address 0x%1 — no database loaded yet").arg(Addr, 0, 16));
+    }
+}
+
 void DecompilerWidget::DecompileFunction(Address Addr, AnalysisDatabase* Db) {
     if (!Db) {
         StatusLabel->setText("No database");
