@@ -9,6 +9,76 @@
 
 namespace Fidra {
 
+FunctionTableModel::FunctionTableModel(QObject* Parent)
+    : QAbstractTableModel(Parent)
+{
+}
+
+int FunctionTableModel::rowCount(const QModelIndex& Parent) const {
+    if (Parent.isValid()) return 0;
+    return static_cast<int>(Functions.size());
+}
+
+int FunctionTableModel::columnCount(const QModelIndex& Parent) const {
+    if (Parent.isValid()) return 0;
+    return ColCount;
+}
+
+QVariant FunctionTableModel::data(const QModelIndex& Index, int Role) const {
+    if (!Index.isValid() || Index.row() >= Functions.size())
+        return {};
+
+    const auto& Func = Functions[Index.row()];
+
+    if (Role == Qt::DisplayRole) {
+        switch (Index.column()) {
+        case ColName:
+            return Func.Name;
+        case ColAddress:
+            return QString("0x%1").arg(Func.StartAddress, 16, 16, QChar('0'));
+        case ColSize:
+            return Func.Size > 0 ? QString::number(Func.Size) : QStringLiteral("?");
+        case ColEndAddress:
+            return Func.EndAddress > 0 ? QString("0x%1").arg(Func.EndAddress, 16, 16, QChar('0')) : QStringLiteral("?");
+        }
+    } else if (Role == Qt::UserRole) {
+        return QVariant::fromValue(Func.StartAddress);
+    }
+
+    return {};
+}
+
+QVariant FunctionTableModel::headerData(int Section, Qt::Orientation Orientation, int Role) const {
+    if (Orientation != Qt::Horizontal || Role != Qt::DisplayRole)
+        return {};
+
+    switch (Section) {
+    case ColName: return QStringLiteral("Name");
+    case ColAddress: return QStringLiteral("Address");
+    case ColSize: return QStringLiteral("Size");
+    case ColEndAddress: return QStringLiteral("End Address");
+    }
+    return {};
+}
+
+void FunctionTableModel::SetFunctions(QList<FunctionEntry>&& Funcs) {
+    beginResetModel();
+    Functions = std::move(Funcs);
+    endResetModel();
+}
+
+void FunctionTableModel::Clear() {
+    beginResetModel();
+    Functions.clear();
+    endResetModel();
+}
+
+Address FunctionTableModel::AddressAt(int Row) const {
+    if (Row < 0 || Row >= Functions.size())
+        return 0;
+    return Functions[Row].StartAddress;
+}
+
 FunctionList::FunctionList(QWidget* Parent)
     : QWidget(Parent)
     , CorePtr(nullptr)
@@ -21,21 +91,29 @@ FunctionList::FunctionList(QWidget* Parent)
     FilterInput->setPlaceholderText("Filter functions...");
     Layout->addWidget(FilterInput);
 
-    TreeWidget = new QTreeWidget(this);
-    TreeWidget->setHeaderLabels({"Name", "Address", "Size", "End Address"});
-    TreeWidget->setAlternatingRowColors(true);
-    TreeWidget->setSelectionMode(QAbstractItemView::SingleSelection);
-    TreeWidget->setRootIsDecorated(false);
-    TreeWidget->setSortingEnabled(true);
-    TreeWidget->header()->setStretchLastSection(true);
-    TreeWidget->header()->setSectionResizeMode(0, QHeaderView::Stretch);
-    TreeWidget->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
-    TreeWidget->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
-    TreeWidget->header()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
-    Layout->addWidget(TreeWidget);
+    Model = new FunctionTableModel(this);
+
+    ProxyModel = new QSortFilterProxyModel(this);
+    ProxyModel->setSourceModel(Model);
+    ProxyModel->setFilterCaseSensitivity(Qt::CaseInsensitive);
+    ProxyModel->setFilterKeyColumn(-1);
+
+    TreeView = new QTreeView(this);
+    TreeView->setModel(ProxyModel);
+    TreeView->setAlternatingRowColors(true);
+    TreeView->setSelectionMode(QAbstractItemView::SingleSelection);
+    TreeView->setRootIsDecorated(false);
+    TreeView->setSortingEnabled(true);
+    TreeView->header()->setStretchLastSection(true);
+    TreeView->header()->setSectionResizeMode(0, QHeaderView::Stretch);
+    TreeView->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    TreeView->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    TreeView->header()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    TreeView->setUniformRowHeights(true);
+    Layout->addWidget(TreeView);
 
     connect(FilterInput, &QLineEdit::textChanged, this, &FunctionList::OnFilterChanged);
-    connect(TreeWidget, &QTreeWidget::itemDoubleClicked, this, &FunctionList::OnItemDoubleClicked);
+    connect(TreeView, &QTreeView::doubleClicked, this, &FunctionList::OnItemDoubleClicked);
 }
 
 FunctionList::~FunctionList() = default;
@@ -53,13 +131,25 @@ void FunctionList::OnProcessAttached(const ProcessInfo& Info) {
 
     if (CorePtr->ReadMemory(Info.BaseAddress, Buffer.data(), ReadSize)) {
         DetectFunctions(Buffer, Info.BaseAddress);
-        PopulateList();
+
+        std::sort(Functions.begin(), Functions.end(),
+            [](const FunctionEntry& A, const FunctionEntry& B) {
+                return A.StartAddress < B.StartAddress;
+            });
+
+        for (int I = 0; I < Functions.size() - 1; ++I) {
+            Functions[I].Size = static_cast<size_t>(Functions[I + 1].StartAddress - Functions[I].StartAddress);
+            Functions[I].EndAddress = Functions[I].StartAddress + Functions[I].Size - 1;
+        }
+
+        Model->SetFunctions(std::move(Functions));
+        Functions.clear();
     }
 }
 
 void FunctionList::OnProcessDetached() {
     Functions.clear();
-    TreeWidget->clear();
+    Model->Clear();
 }
 
 void FunctionList::AnalyzeFunctions(Address StartAddr, size_t Size) {
@@ -69,7 +159,19 @@ void FunctionList::AnalyzeFunctions(Address StartAddr, size_t Size) {
     QByteArray Buffer(static_cast<qsizetype>(Size), '\0');
     if (CorePtr->ReadMemory(StartAddr, Buffer.data(), Size)) {
         DetectFunctions(Buffer, StartAddr);
-        PopulateList();
+
+        std::sort(Functions.begin(), Functions.end(),
+            [](const FunctionEntry& A, const FunctionEntry& B) {
+                return A.StartAddress < B.StartAddress;
+            });
+
+        for (int I = 0; I < Functions.size() - 1; ++I) {
+            Functions[I].Size = static_cast<size_t>(Functions[I + 1].StartAddress - Functions[I].StartAddress);
+            Functions[I].EndAddress = Functions[I].StartAddress + Functions[I].Size - 1;
+        }
+
+        Model->SetFunctions(std::move(Functions));
+        Functions.clear();
     }
 }
 
@@ -137,47 +239,25 @@ void FunctionList::DetectFunctions(const QByteArray& Data, Address BaseAddr) {
             Functions.append(Entry);
         }
     }
-
-    std::sort(Functions.begin(), Functions.end(),
-        [](const FunctionEntry& A, const FunctionEntry& B) {
-            return A.StartAddress < B.StartAddress;
-        });
-
-    for (int I = 0; I < Functions.size() - 1; ++I) {
-        Functions[I].Size = static_cast<size_t>(Functions[I + 1].StartAddress - Functions[I].StartAddress);
-        Functions[I].EndAddress = Functions[I].StartAddress + Functions[I].Size - 1;
-    }
 }
 
-void FunctionList::PopulateList() {
-    TreeWidget->clear();
-
-    for (const auto& Func : Functions) {
-        auto* Item = new QTreeWidgetItem();
-        Item->setText(0, Func.Name);
-        Item->setText(1, QString("0x%1").arg(Func.StartAddress, 16, 16, QChar('0')));
-        Item->setText(2, Func.Size > 0 ? QString::number(Func.Size) : "?");
-        Item->setText(3, Func.EndAddress > 0 ? QString("0x%1").arg(Func.EndAddress, 16, 16, QChar('0')) : "?");
-        Item->setData(0, Qt::UserRole, QVariant::fromValue(Func.StartAddress));
-        TreeWidget->addTopLevelItem(Item);
-    }
-}
-
-void FunctionList::OnItemDoubleClicked(QTreeWidgetItem* Item, int Column) {
-    Q_UNUSED(Column);
-    if (!Item)
+void FunctionList::OnItemDoubleClicked(const QModelIndex& Index) {
+    if (!Index.isValid())
         return;
 
-    Address Addr = Item->data(0, Qt::UserRole).toULongLong();
-    emit FunctionSelected(Addr);
+    QModelIndex SourceIndex = ProxyModel->mapToSource(Index);
+    Address Addr = Model->AddressAt(SourceIndex.row());
+    if (Addr != 0)
+        emit FunctionSelected(Addr);
 }
 
 void FunctionList::LoadFromAnalysisDatabase(AnalysisDatabase* Db) {
     if (!Db) return;
 
-    Functions.clear();
-
     QList<AnalyzedFunction> AllFuncs = Db->GetAllFunctions();
+
+    QList<FunctionEntry> Entries;
+    Entries.reserve(AllFuncs.size());
 
     for (const auto& Af : AllFuncs) {
         FunctionEntry Entry;
@@ -185,25 +265,19 @@ void FunctionList::LoadFromAnalysisDatabase(AnalysisDatabase* Db) {
         Entry.EndAddress = Af.End;
         Entry.Name = Af.Name;
         Entry.Size = Af.Size;
-        Functions.append(Entry);
+        Entries.append(Entry);
     }
 
-    std::sort(Functions.begin(), Functions.end(),
+    std::sort(Entries.begin(), Entries.end(),
         [](const FunctionEntry& A, const FunctionEntry& B) {
             return A.StartAddress < B.StartAddress;
         });
 
-    PopulateList();
+    Model->SetFunctions(std::move(Entries));
 }
 
 void FunctionList::OnFilterChanged(const QString& Text) {
-    for (int I = 0; I < TreeWidget->topLevelItemCount(); ++I) {
-        QTreeWidgetItem* Item = TreeWidget->topLevelItem(I);
-        bool Matches = Text.isEmpty() ||
-            Item->text(0).contains(Text, Qt::CaseInsensitive) ||
-            Item->text(1).contains(Text, Qt::CaseInsensitive);
-        Item->setHidden(!Matches);
-    }
+    ProxyModel->setFilterFixedString(Text);
 }
 
 }

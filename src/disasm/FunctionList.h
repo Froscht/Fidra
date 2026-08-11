@@ -2,9 +2,11 @@
 
 #include <fidra/Types.h>
 #include <QWidget>
-#include <QTreeWidget>
+#include <QTreeView>
 #include <QLineEdit>
 #include <QList>
+#include <QAbstractTableModel>
+#include <QSortFilterProxyModel>
 
 namespace Fidra {
 
@@ -17,6 +19,27 @@ struct FunctionEntry {
     Address EndAddress;
     QString Name;
     size_t Size;
+};
+
+class FunctionTableModel : public QAbstractTableModel {
+    Q_OBJECT
+
+public:
+    enum Column { ColName = 0, ColAddress, ColSize, ColEndAddress, ColCount };
+
+    explicit FunctionTableModel(QObject* Parent = nullptr);
+
+    int rowCount(const QModelIndex& Parent = QModelIndex()) const override;
+    int columnCount(const QModelIndex& Parent = QModelIndex()) const override;
+    QVariant data(const QModelIndex& Index, int Role = Qt::DisplayRole) const override;
+    QVariant headerData(int Section, Qt::Orientation Orientation, int Role = Qt::DisplayRole) const override;
+
+    void SetFunctions(QList<FunctionEntry>&& Funcs);
+    void Clear();
+    Address AddressAt(int Row) const;
+
+private:
+    QList<FunctionEntry> Functions;
 };
 
 class FunctionList : public QWidget {
@@ -36,16 +59,17 @@ signals:
     void FunctionSelected(Address Addr);
 
 private slots:
-    void OnItemDoubleClicked(QTreeWidgetItem* Item, int Column);
+    void OnItemDoubleClicked(const QModelIndex& Index);
     void OnFilterChanged(const QString& Text);
 
 private:
-    void PopulateList();
     void DetectFunctions(const QByteArray& Data, Address BaseAddr);
 
     ICore* CorePtr;
-    QTreeWidget* TreeWidget;
+    QTreeView* TreeView;
     QLineEdit* FilterInput;
+    FunctionTableModel* Model;
+    QSortFilterProxyModel* ProxyModel;
     QList<FunctionEntry> Functions;
 };
 
