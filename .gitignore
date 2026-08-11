@@ -1,0 +1,57 @@
+# Build
+build/
+cmake-build-*/
+out/
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.lib
+*.dll
+*.exe
+moc_*
+ui_*
+qrc_*
+*_autogen/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.cache/
+compile_commands.json
+.clangd/
+.ccls-cache/
+*.user
+*.creator.user
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Debug
+*.dSYM/
+core
+core.*
+vgcore.*
+
+# Package
+*.tar.gz
+*.zip
+*.deb
+*.rpm
+*.AppImage
+
+# Temp
+*.log
+*.tmp
+*.bak
+*.orig
+
+# Binary output
+Fidra
+fidra

@@ -1,0 +1,105 @@
+#pragma once
+
+#include <ntddk.h>
+
+#pragma pack(push, 1)
+
+#define MAX_PROCESS_NAME_LENGTH 260
+#define MAX_MODULE_NAME_LENGTH  260
+#define MAX_PROCESS_COUNT       1024
+#define MAX_MODULE_COUNT        512
+#define MAX_THREAD_COUNT        256
+#define MAX_MEMORY_BUFFER_SIZE  (1024 * 1024)
+
+typedef struct _READ_MEMORY_REQUEST {
+    ULONG ProcessId;
+    ULONG64 Address;
+    ULONG Size;
+} READ_MEMORY_REQUEST, *PREAD_MEMORY_REQUEST;
+
+typedef struct _READ_MEMORY_RESPONSE {
+    NTSTATUS Status;
+    ULONG BytesRead;
+    UCHAR Data[1];
+} READ_MEMORY_RESPONSE, *PREAD_MEMORY_RESPONSE;
+
+typedef struct _WRITE_MEMORY_REQUEST {
+    ULONG ProcessId;
+    ULONG64 Address;
+    ULONG Size;
+    UCHAR Data[1];
+} WRITE_MEMORY_REQUEST, *PWRITE_MEMORY_REQUEST;
+
+typedef struct _WRITE_MEMORY_RESPONSE {
+    NTSTATUS Status;
+    ULONG BytesWritten;
+} WRITE_MEMORY_RESPONSE, *PWRITE_MEMORY_RESPONSE;
+
+typedef struct _GET_BASE_REQUEST {
+    ULONG ProcessId;
+} GET_BASE_REQUEST, *PGET_BASE_REQUEST;
+
+typedef struct _GET_BASE_RESPONSE {
+    NTSTATUS Status;
+    ULONG64 BaseAddress;
+} GET_BASE_RESPONSE, *PGET_BASE_RESPONSE;
+
+typedef struct _PROCESS_ENTRY {
+    ULONG ProcessId;
+    WCHAR ProcessName[MAX_PROCESS_NAME_LENGTH];
+} PROCESS_ENTRY, *PPROCESS_ENTRY;
+
+typedef struct _GET_PROCESS_LIST_RESPONSE {
+    NTSTATUS Status;
+    ULONG Count;
+    PROCESS_ENTRY Entries[1];
+} GET_PROCESS_LIST_RESPONSE, *PGET_PROCESS_LIST_RESPONSE;
+
+typedef struct _GET_MODULES_REQUEST {
+    ULONG ProcessId;
+} GET_MODULES_REQUEST, *PGET_MODULES_REQUEST;
+
+typedef struct _MODULE_ENTRY {
+    ULONG64 BaseAddress;
+    ULONG Size;
+    WCHAR ModuleName[MAX_MODULE_NAME_LENGTH];
+} MODULE_ENTRY, *PMODULE_ENTRY;
+
+typedef struct _GET_MODULES_RESPONSE {
+    NTSTATUS Status;
+    ULONG Count;
+    MODULE_ENTRY Entries[1];
+} GET_MODULES_RESPONSE, *PGET_MODULES_RESPONSE;
+
+typedef struct _READ_PHYSICAL_REQUEST {
+    ULONG64 PhysicalAddress;
+    ULONG Size;
+} READ_PHYSICAL_REQUEST, *PREAD_PHYSICAL_REQUEST;
+
+typedef struct _READ_PHYSICAL_RESPONSE {
+    NTSTATUS Status;
+    ULONG BytesRead;
+    UCHAR Data[1];
+} READ_PHYSICAL_RESPONSE, *PREAD_PHYSICAL_RESPONSE;
+
+typedef struct _WRITE_PHYSICAL_REQUEST {
+    ULONG64 PhysicalAddress;
+    ULONG Size;
+    UCHAR Data[1];
+} WRITE_PHYSICAL_REQUEST, *PWRITE_PHYSICAL_REQUEST;
+
+typedef struct _WRITE_PHYSICAL_RESPONSE {
+    NTSTATUS Status;
+    ULONG BytesWritten;
+} WRITE_PHYSICAL_RESPONSE, *PWRITE_PHYSICAL_RESPONSE;
+
+typedef struct _GET_CR3_REQUEST {
+    ULONG ProcessId;
+} GET_CR3_REQUEST, *PGET_CR3_REQUEST;
+
+typedef struct _GET_CR3_RESPONSE {
+    NTSTATUS Status;
+    ULONG64 DirectoryTableBase;
+} GET_CR3_RESPONSE, *PGET_CR3_RESPONSE;
+
+#pragma pack(pop)
