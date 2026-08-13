@@ -8,6 +8,7 @@
 #include <QAtomicInt>
 #include <QMutex>
 #include <QWaitCondition>
+#include <QElapsedTimer>
 
 namespace Fidra {
 
@@ -44,6 +45,14 @@ private:
     void FindFunctions();
     void AnalyzeFunctions();
     void AnalyzeFunction(AnalyzedFunction& Func);
+    void BuildBasicBlocks(AnalyzedFunction& Func, const QList<AnalyzedInstruction>& Insns);
+    void ComputeDominance(AnalyzedFunction& Func);
+    void DetectLoops(AnalyzedFunction& Func);
+    void ComputeFunctionBoundaryCFG(AnalyzedFunction& Func, const QSet<Address>& OtherFuncStarts);
+    CallingConvention DetectCallingConvention(const QList<AnalyzedInstruction>& Insns, bool Is64Bit);
+    int ComputeStackFrameEquation(const QList<AnalyzedInstruction>& Insns, const QList<BasicBlock>& Blocks);
+    int DetectArgCount(const QList<AnalyzedInstruction>& Insns, bool Is64Bit, CallingConvention Conv);
+    void ResolveRelativeJumpTables(const BinaryInfo& Info);
 
     void FindStrings();
     bool IsAsciiString(const uint8_t* Data, size_t MaxLen, int& OutLen);
@@ -88,6 +97,10 @@ private:
     QAtomicInt TotalDisasmMT;
 
     SignatureMatcher SigMatcher;
+
+    QElapsedTimer AnalysisTimer;
+    QString CurrentSectionName;
+    Address CurrentAnalysisAddr = 0;
 };
 
 class AnalysisEngine : public QObject {

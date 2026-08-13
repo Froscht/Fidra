@@ -4,6 +4,7 @@
 #include <QFileInfo>
 #include <QThread>
 #include <QtConcurrent>
+#include <QElapsedTimer>
 #include <cstring>
 #include <cmath>
 #include <algorithm>
@@ -17,6 +18,7 @@ AnalysisWorker::AnalysisWorker(AnalysisDatabase* Db, QObject* Parent)
     : QObject(Parent)
     , Db(Db)
     , Cancelled(0) {
+    AnalysisTimer.start();
 }
 
 AnalysisWorker::~AnalysisWorker() {
@@ -27,6 +29,9 @@ void AnalysisWorker::Cancel() {
 }
 
 void AnalysisWorker::Run() {
+    AnalysisTimer.restart();
+    CurrentSectionName.clear();
+    CurrentAnalysisAddr = 0;
     EmitProgress(AnalysisState::Loading, 0, "Loading binary...");
     LoadBinary();
     if (Cancelled.loadRelaxed()) { emit Finished(false); return; }
@@ -37,6 +42,8 @@ void AnalysisWorker::Run() {
         emit Finished(false);
         return;
     }
+
+    Db->BuildSegmentCache();
 
     EmitProgress(AnalysisState::Loading, 3, "Parsing exception directory...");
     ParsePdata();
@@ -76,6 +83,8 @@ void AnalysisWorker::Run() {
     EmitProgress(AnalysisState::Disassembling, 38, "Filling code gaps (aggressive scan)...");
     FillCodeGaps();
     if (Cancelled.loadRelaxed()) { emit Finished(false); return; }
+
+    Db->BuildInstructionIndex();
 
     EmitProgress(AnalysisState::FindingFunctions, 42, "Detecting tail call functions...");
     DetectTailCallFunctions();
@@ -117,16 +126,16 @@ void AnalysisWorker::Run() {
     MatchSignatures();
     if (Cancelled.loadRelaxed()) { emit Finished(false); return; }
 
-    EmitProgress(AnalysisState::AnalyzingFunctions, 77, "Detecting non-returning functions...");
-    DetectNonReturning();
-    if (Cancelled.loadRelaxed()) { emit Finished(false); return; }
-
-    EmitProgress(AnalysisState::AnalyzingFunctions, 79, "Parsing C++ RTTI...");
+    EmitProgress(AnalysisState::AnalyzingFunctions, 77, "Parsing C++ RTTI...");
     ParseRtti();
     if (Cancelled.loadRelaxed()) { emit Finished(false); return; }
 
-    EmitProgress(AnalysisState::AnalyzingFunctions, 82, "Analyzing functions...");
+    EmitProgress(AnalysisState::AnalyzingFunctions, 80, "Analyzing functions (CFG/dominance/stack)...");
     AnalyzeFunctions();
+    if (Cancelled.loadRelaxed()) { emit Finished(false); return; }
+
+    EmitProgress(AnalysisState::AnalyzingFunctions, 92, "Detecting non-returning functions...");
+    DetectNonReturning();
     if (Cancelled.loadRelaxed()) { emit Finished(false); return; }
 
     EmitProgress(AnalysisState::AnalyzingFunctions, 95, "Detecting thunks...");
@@ -1113,23 +1122,46 @@ void AnalysisWorker::DisassembleFromMT(Address Start, size_t CsHandle) {
             Ai.Comment = QString();
             Ai.BranchTarget = 0;
             Ai.MemoryRef = 0;
-
-            QString Mn = Ai.Mnemonic.toLower();
-            Ai.IsCall = Mn.startsWith("call");
-            Ai.IsRet = (Mn == "ret" || Mn == "retn" || Mn == "retf");
-            Ai.IsNop = (Mn == "nop");
-            Ai.IsPush = Mn.startsWith("push");
-            Ai.IsPop = Mn.startsWith("pop");
-            Ai.IsJump = Mn.startsWith('j') || Mn == "jmp";
-            Ai.IsConditional = Ai.IsJump && Mn != "jmp";
+            Ai.IsIndirectJump = false;
+            Ai.IsIndirectCall = false;
+            Ai.IsHalt = false;
 
             cs_detail* Detail = Insns[I].detail;
+            bool HasGrpJump = false;
+            bool HasGrpCall = false;
+            bool HasGrpRet = false;
+            bool HasGrpInt = false;
+            bool HasGrpIret = false;
+            if (Detail) {
+                for (uint8_t G = 0; G < Detail->groups_count; ++G) {
+                    switch (Detail->groups[G]) {
+                    case CS_GRP_JUMP: HasGrpJump = true; break;
+                    case CS_GRP_CALL: HasGrpCall = true; break;
+                    case CS_GRP_RET: HasGrpRet = true; break;
+                    case CS_GRP_INT: HasGrpInt = true; break;
+                    case CS_GRP_IRET: HasGrpIret = true; break;
+                    }
+                }
+            }
+
+            QString Mn = Ai.Mnemonic.toLower();
+            Ai.IsCall = HasGrpCall || Mn.startsWith("call");
+            Ai.IsRet = HasGrpRet || HasGrpIret || Mn == "ret" || Mn == "retn" || Mn == "retf" || Mn == "iret" || Mn == "iretd" || Mn == "iretq" || Mn == "sysexit" || Mn == "sysret";
+            Ai.IsNop = (Mn == "nop" || Mn == "fnop" || (Mn == "xchg" && Ai.Operands.toLower() == "eax, eax"));
+            Ai.IsPush = Mn.startsWith("push");
+            Ai.IsPop = Mn.startsWith("pop");
+            Ai.IsJump = HasGrpJump || Mn.startsWith('j') || Mn == "jmp";
+            Ai.IsConditional = Ai.IsJump && Mn != "jmp";
+            Ai.IsHalt = (Mn == "int3" || Mn == "hlt" || Mn == "ud2" || Mn == "ud0" || Mn == "ud1");
+
             if (Detail) {
                 cs_x86* X86 = &Detail->x86;
+                bool HasImmTarget = false;
                 for (uint8_t OpIdx = 0; OpIdx < X86->op_count; ++OpIdx) {
                     cs_x86_op* Op = &X86->operands[OpIdx];
                     if (Op->type == X86_OP_IMM && (Ai.IsCall || Ai.IsJump)) {
                         Ai.BranchTarget = static_cast<Address>(Op->imm);
+                        HasImmTarget = true;
                     }
                     if (Op->type == X86_OP_MEM) {
                         if (Op->mem.base == X86_REG_RIP || Op->mem.base == X86_REG_EIP) {
@@ -1137,6 +1169,18 @@ void AnalysisWorker::DisassembleFromMT(Address Start, size_t CsHandle) {
                             Ai.MemoryRef = static_cast<Address>(static_cast<int64_t>(NextAddr) + Op->mem.disp);
                         } else if (Op->mem.base == X86_REG_INVALID && Op->mem.index == X86_REG_INVALID && Op->mem.disp != 0) {
                             Ai.MemoryRef = static_cast<Address>(Op->mem.disp);
+                        }
+                    }
+                    if (Op->type == X86_OP_REG && (Ai.IsJump || Ai.IsCall)) {
+                        if (!HasImmTarget) {
+                            if (Ai.IsJump) Ai.IsIndirectJump = true;
+                            if (Ai.IsCall) Ai.IsIndirectCall = true;
+                        }
+                    }
+                    if (Op->type == X86_OP_MEM && (Ai.IsJump || Ai.IsCall)) {
+                        if (!HasImmTarget) {
+                            if (Ai.IsJump) Ai.IsIndirectJump = true;
+                            if (Ai.IsCall) Ai.IsIndirectCall = true;
                         }
                     }
                 }
@@ -1171,7 +1215,7 @@ void AnalysisWorker::DisassembleFromMT(Address Start, size_t CsHandle) {
             }
 
             if (Ai.IsRet) StopFlow = true;
-            if (Ai.Mnemonic == "int3" || Ai.Mnemonic == "hlt" || Ai.Mnemonic == "ud2") StopFlow = true;
+            if (Ai.IsHalt) StopFlow = true;
         }
 
         Address LastAddr = Insns[Count - 1].address;
@@ -1216,6 +1260,97 @@ void AnalysisWorker::RunRecursiveDescentMT() {
                 FunctionStarts.insert(Exp.Addr);
             }
         }
+
+        int SectionSeeded = 0;
+        for (const Segment& Seg : Info.Segments) {
+            if (Seg.Type != SegmentType::Code && !Seg.IsExecutable) continue;
+            if (Seg.Data.isEmpty()) continue;
+
+            Address SectionStart = Seg.VirtualAddress;
+            if (QueuedSetMT.contains(SectionStart)) continue;
+
+            QByteArray FirstBytes = Db->ReadBytes(SectionStart, 4);
+            if (FirstBytes.size() >= 4) {
+                uint8_t B0 = static_cast<uint8_t>(FirstBytes[0]);
+                if (B0 != 0x00 && B0 != 0xCC) {
+                    AddDisassemblyTargetMT(SectionStart);
+                    FunctionStarts.insert(SectionStart);
+                    SectionSeeded++;
+                }
+            }
+
+            const uint8_t* SData = reinterpret_cast<const uint8_t*>(Seg.Data.constData());
+            size_t SSize = static_cast<size_t>(Seg.Data.size());
+            size_t Step = 0x1000;
+            for (size_t Off = Step; Off + 16 <= SSize; Off += Step) {
+                if (SData[Off] == 0x00 || SData[Off] == 0xCC) continue;
+                Address Addr = Seg.VirtualAddress + Off;
+                if (QueuedSetMT.contains(Addr)) continue;
+
+                bool IsPrologue = false;
+                if (SData[Off] == 0x55 && Off + 3 < SSize &&
+                    SData[Off+1] == 0x48 && SData[Off+2] == 0x89 && SData[Off+3] == 0xE5) {
+                    IsPrologue = true;
+                }
+                if (!IsPrologue && SData[Off] == 0x48 && Off + 3 < SSize &&
+                    SData[Off+1] == 0x89 && SData[Off+2] == 0x5C && SData[Off+3] == 0x24) {
+                    IsPrologue = true;
+                }
+                if (!IsPrologue && SData[Off] == 0x48 && Off + 2 < SSize &&
+                    SData[Off+1] == 0x83 && SData[Off+2] == 0xEC) {
+                    IsPrologue = true;
+                }
+                if (!IsPrologue && SData[Off] == 0x40 && Off + 1 < SSize &&
+                    (SData[Off+1] == 0x53 || SData[Off+1] == 0x55 ||
+                     SData[Off+1] == 0x56 || SData[Off+1] == 0x57)) {
+                    IsPrologue = true;
+                }
+                if (!IsPrologue && Off + 3 < SSize &&
+                    SData[Off] == 0xF3 && SData[Off+1] == 0x0F &&
+                    SData[Off+2] == 0x1E && SData[Off+3] == 0xFA) {
+                    IsPrologue = true;
+                }
+                if (!IsPrologue && SData[Off] == 0x55 && Off + 2 < SSize &&
+                    SData[Off+1] == 0x8B && SData[Off+2] == 0xEC) {
+                    IsPrologue = true;
+                }
+
+                if (IsPrologue) {
+                    AddDisassemblyTargetMT(Addr);
+                    FunctionStarts.insert(Addr);
+                    SectionSeeded++;
+                }
+            }
+        }
+        if (SectionSeeded > 0) {
+            emit LogMessage(QString("Seeded %1 code section entry points for disassembly").arg(SectionSeeded));
+        }
+
+        int ThunkSeeded = 0;
+        for (const auto& Imp : Info.Imports) {
+            if (Imp.ThunkAddress == 0) continue;
+            if (QueuedSetMT.contains(Imp.ThunkAddress)) continue;
+            if (!Db->IsAddressValid(Imp.ThunkAddress)) continue;
+            QByteArray ThunkBytes = Db->ReadBytes(Imp.ThunkAddress, 6);
+            if (ThunkBytes.size() >= 6) {
+                uint8_t B0 = static_cast<uint8_t>(ThunkBytes[0]);
+                uint8_t B1 = static_cast<uint8_t>(ThunkBytes[1]);
+                if (B0 == 0xFF && B1 == 0x25) {
+                    AddDisassemblyTargetMT(Imp.ThunkAddress);
+                    FunctionStarts.insert(Imp.ThunkAddress);
+                    ThunkSeeded++;
+                }
+                if (B0 == 0x48 && B1 == 0xFF) {
+                    AddDisassemblyTargetMT(Imp.ThunkAddress);
+                    FunctionStarts.insert(Imp.ThunkAddress);
+                    ThunkSeeded++;
+                }
+            }
+        }
+        if (ThunkSeeded > 0) {
+            emit LogMessage(QString("Seeded %1 import thunks for disassembly").arg(ThunkSeeded));
+        }
+
         for (Address FuncAddr : FunctionStarts) {
             if (QueuedSetMT.contains(FuncAddr)) continue;
             QByteArray Bytes = Db->ReadBytes(FuncAddr, 4);
@@ -1292,9 +1427,18 @@ void AnalysisWorker::RunRecursiveDescentMT() {
         int Current = TotalDisasmMT.loadRelaxed();
         if (Current - LastReported >= 1000) {
             int QueueSize = 0;
+            Address PeekAddr = 0;
             {
                 QMutexLocker Locker(&QueueMutex);
                 QueueSize = QueueMT.size();
+                if (!QueueMT.isEmpty()) PeekAddr = QueueMT.first();
+            }
+            CurrentAnalysisAddr = PeekAddr;
+            for (const Segment& Seg : Info.Segments) {
+                if (PeekAddr >= Seg.VirtualAddress && PeekAddr < Seg.VirtualAddress + Seg.VirtualSize) {
+                    CurrentSectionName = Seg.Name;
+                    break;
+                }
             }
             EmitProgress(AnalysisState::Disassembling,
                 10 + std::min(30, Current / 100),
@@ -1468,23 +1612,42 @@ void AnalysisWorker::DisassembleFrom(Address Start) {
             Ai.Comment = QString();
             Ai.BranchTarget = 0;
             Ai.MemoryRef = 0;
-
-            QString Mn = Ai.Mnemonic.toLower();
-            Ai.IsCall = Mn.startsWith("call");
-            Ai.IsRet = (Mn == "ret" || Mn == "retn" || Mn == "retf");
-            Ai.IsNop = (Mn == "nop");
-            Ai.IsPush = Mn.startsWith("push");
-            Ai.IsPop = Mn.startsWith("pop");
-            Ai.IsJump = Mn.startsWith('j') || Mn == "jmp";
-            Ai.IsConditional = Ai.IsJump && Mn != "jmp";
+            Ai.IsIndirectJump = false;
+            Ai.IsIndirectCall = false;
+            Ai.IsHalt = false;
 
             cs_detail* Detail = Insns[I].detail;
+            bool HasGrpJump = false;
+            bool HasGrpCall = false;
+            bool HasGrpRet = false;
+            if (Detail) {
+                for (uint8_t G = 0; G < Detail->groups_count; ++G) {
+                    switch (Detail->groups[G]) {
+                    case CS_GRP_JUMP: HasGrpJump = true; break;
+                    case CS_GRP_CALL: HasGrpCall = true; break;
+                    case CS_GRP_RET: HasGrpRet = true; break;
+                    }
+                }
+            }
+
+            QString Mn = Ai.Mnemonic.toLower();
+            Ai.IsCall = HasGrpCall || Mn.startsWith("call");
+            Ai.IsRet = HasGrpRet || Mn == "ret" || Mn == "retn" || Mn == "retf" || Mn == "iret" || Mn == "iretd" || Mn == "iretq";
+            Ai.IsNop = (Mn == "nop" || Mn == "fnop" || (Mn == "xchg" && Ai.Operands.toLower() == "eax, eax"));
+            Ai.IsPush = Mn.startsWith("push");
+            Ai.IsPop = Mn.startsWith("pop");
+            Ai.IsJump = HasGrpJump || Mn.startsWith('j') || Mn == "jmp";
+            Ai.IsConditional = Ai.IsJump && Mn != "jmp";
+            Ai.IsHalt = (Mn == "int3" || Mn == "hlt" || Mn == "ud2" || Mn == "ud0" || Mn == "ud1");
+
             if (Detail && CsArch == CS_ARCH_X86) {
                 cs_x86* X86 = &Detail->x86;
+                bool HasImmTarget = false;
                 for (uint8_t OpIdx = 0; OpIdx < X86->op_count; ++OpIdx) {
                     cs_x86_op* Op = &X86->operands[OpIdx];
                     if (Op->type == X86_OP_IMM && (Ai.IsCall || Ai.IsJump)) {
                         Ai.BranchTarget = static_cast<Address>(Op->imm);
+                        HasImmTarget = true;
                     }
                     if (Op->type == X86_OP_MEM) {
                         if (Op->mem.base == X86_REG_RIP || Op->mem.base == X86_REG_EIP) {
@@ -1493,6 +1656,10 @@ void AnalysisWorker::DisassembleFrom(Address Start) {
                         } else if (Op->mem.base == X86_REG_INVALID && Op->mem.index == X86_REG_INVALID && Op->mem.disp != 0) {
                             Ai.MemoryRef = static_cast<Address>(Op->mem.disp);
                         }
+                    }
+                    if ((Op->type == X86_OP_REG || Op->type == X86_OP_MEM) && (Ai.IsJump || Ai.IsCall) && !HasImmTarget) {
+                        if (Ai.IsJump) Ai.IsIndirectJump = true;
+                        if (Ai.IsCall) Ai.IsIndirectCall = true;
                     }
                 }
             }
@@ -1515,13 +1682,8 @@ void AnalysisWorker::DisassembleFrom(Address Start) {
                 AddDisassemblyTarget(Ai.BranchTarget);
             }
 
-            if (Ai.IsRet) {
-                StopFlow = true;
-            }
-
-            if (Ai.Mnemonic == "int3" || Ai.Mnemonic == "hlt" || Ai.Mnemonic == "ud2") {
-                StopFlow = true;
-            }
+            if (Ai.IsRet) StopFlow = true;
+            if (Ai.IsHalt) StopFlow = true;
         }
 
         Address LastAddr = Insns[Count - 1].address;
@@ -1630,40 +1792,69 @@ void AnalysisWorker::FindFunctions() {
         return A.Start < B.Start;
     });
 
+    QSet<Address> AllFuncStarts;
+    for (const auto& F : AllFuncs) AllFuncStarts.insert(F.Start);
+
     for (int I = 0; I < AllFuncs.size(); ++I) {
         if (Cancelled.loadRelaxed()) return;
 
-        Address FuncStart = AllFuncs[I].Start;
-        Address FuncEnd = FuncStart;
-
-        Address Limit = 0;
-        if (I + 1 < AllFuncs.size()) {
-            Limit = AllFuncs[I + 1].Start;
-        }
-
-        QList<AnalyzedInstruction> FuncInsns = Db->GetInstructions(FuncStart,
-            Limit > 0 ? Limit : FuncStart + 0x10000);
-
-        int InsnCount = 0;
-        for (const auto& Insn : FuncInsns) {
-            if (Insn.Addr < FuncStart) continue;
-            if (Limit > 0 && Insn.Addr >= Limit) break;
-
-            InsnCount++;
-            Address InsnEnd = Insn.Addr + Insn.Size;
-            if (InsnEnd > FuncEnd) FuncEnd = InsnEnd;
-
-            if (Insn.IsRet) break;
-        }
-
         AnalyzedFunction Updated = AllFuncs[I];
-        Updated.End = FuncEnd;
-        Updated.Size = static_cast<size_t>(FuncEnd - FuncStart);
-        Updated.InstructionCount = InsnCount;
-        Db->UpdateFunction(FuncStart, Updated);
+        ComputeFunctionBoundaryCFG(Updated, AllFuncStarts);
+        Db->UpdateFunction(Updated.Start, Updated);
     }
 
     emit LogMessage(QString("Found %1 functions").arg(Db->FunctionCount()));
+}
+
+void AnalysisWorker::ComputeFunctionBoundaryCFG(AnalyzedFunction& Func, const QSet<Address>& OtherFuncStarts) {
+    QSet<Address> Visited;
+    QList<Address> Worklist;
+    Worklist.append(Func.Start);
+    Address MaxEnd = Func.Start;
+    int InsnCount = 0;
+    constexpr int MaxInsnPerFunc = 100000;
+
+    while (!Worklist.isEmpty() && InsnCount < MaxInsnPerFunc) {
+        Address Addr = Worklist.takeLast();
+        if (Visited.contains(Addr)) continue;
+        if (Addr != Func.Start && OtherFuncStarts.contains(Addr)) continue;
+        if (!Db->HasInstruction(Addr)) continue;
+
+        AnalyzedInstruction Insn = Db->GetInstruction(Addr);
+        Visited.insert(Addr);
+        InsnCount++;
+
+        Address InsnEnd = Addr + Insn.Size;
+        if (InsnEnd > MaxEnd) MaxEnd = InsnEnd;
+
+        if (Insn.IsRet || Insn.IsHalt) continue;
+
+        if (Insn.IsJump && !Insn.IsConditional) {
+            if (Insn.BranchTarget != 0 && !Visited.contains(Insn.BranchTarget)) {
+                if (!OtherFuncStarts.contains(Insn.BranchTarget) || Insn.BranchTarget == Func.Start) {
+                    Worklist.append(Insn.BranchTarget);
+                } else {
+                    Func.HasTailCalls = true;
+                }
+            }
+            continue;
+        }
+
+        if (Insn.IsConditional) {
+            if (Insn.BranchTarget != 0 && !Visited.contains(Insn.BranchTarget)) {
+                Worklist.append(Insn.BranchTarget);
+            }
+        }
+
+        Address FallThrough = Addr + Insn.Size;
+        if (!Visited.contains(FallThrough)) {
+            Worklist.append(FallThrough);
+        }
+    }
+
+    Func.End = MaxEnd;
+    Func.Size = static_cast<size_t>(MaxEnd - Func.Start);
+    Func.InstructionCount = InsnCount;
 }
 
 void AnalysisWorker::FindStrings() {
@@ -1960,72 +2151,498 @@ void AnalysisWorker::AnalyzeFunction(AnalyzedFunction& Func) {
         }
     }
 
-    Func.StackFrameSize = 0;
-    for (const auto& Insn : Insns) {
-        if (Insn.Addr > Func.Start + 32) break;
-        QString Mn = Insn.Mnemonic.toLower();
-        QString Op = Insn.Operands.toLower();
+    BuildBasicBlocks(Func, Insns);
+    Func.BasicBlockCount = Func.Blocks.size();
 
-        if (Mn == "sub" && (Op.startsWith("rsp,") || Op.startsWith("esp,"))) {
-            QString ValStr = Op.mid(Op.indexOf(',') + 1).trimmed();
-            if (ValStr.startsWith("0x")) {
-                Func.StackFrameSize = ValStr.mid(2).toInt(nullptr, 16);
-            } else {
-                Func.StackFrameSize = ValStr.toInt();
-            }
-            break;
-        }
+    if (Func.Blocks.size() >= 2) {
+        ComputeDominance(Func);
+        DetectLoops(Func);
     }
 
-    Func.ArgCount = 0;
-    if (Info.Is64Bit) {
-        bool UsesRcx = false, UsesRdx = false, UsesR8 = false, UsesR9 = false;
-        for (const auto& Insn : Insns) {
-            if (Insn.Addr > Func.Start + 64) break;
-            QString Op = Insn.Operands.toLower();
-            if (Op.contains("rcx") || Op.contains("ecx")) UsesRcx = true;
-            if (Op.contains("rdx") || Op.contains("edx")) UsesRdx = true;
-            if (Op.contains("r8")) UsesR8 = true;
-            if (Op.contains("r9")) UsesR9 = true;
-        }
-        if (UsesR9) Func.ArgCount = 4;
-        else if (UsesR8) Func.ArgCount = 3;
-        else if (UsesRdx) Func.ArgCount = 2;
-        else if (UsesRcx) Func.ArgCount = 1;
-    } else {
-        int MaxArgOffset = 0;
-        for (const auto& Insn : Insns) {
-            if (Insn.Addr > Func.Start + 64) break;
-            QString Op = Insn.Operands.toLower();
-            QRegularExpression Re("\\[ebp\\+(?:0x)?([0-9a-f]+)\\]");
-            auto Match = Re.match(Op);
-            if (Match.hasMatch()) {
-                int Off = Match.captured(1).toInt(nullptr, 16);
-                if (Off >= 8 && Off < 0x100) {
-                    int ArgIdx = (Off - 8) / 4 + 1;
-                    if (ArgIdx > MaxArgOffset) MaxArgOffset = ArgIdx;
-                }
-            }
-        }
-        Func.ArgCount = MaxArgOffset;
+    Func.StackFrameSize = ComputeStackFrameEquation(Insns, Func.Blocks);
+    Func.Convention = DetectCallingConvention(Insns, Info.Is64Bit);
+    Func.ArgCount = DetectArgCount(Insns, Info.Is64Bit, Func.Convention);
+}
+
+void AnalysisWorker::BuildBasicBlocks(AnalyzedFunction& Func, const QList<AnalyzedInstruction>& Insns) {
+    Func.Blocks.clear();
+    if (Insns.isEmpty()) return;
+
+    QMap<Address, int> AddrToInsn;
+    for (int I = 0; I < Insns.size(); ++I) {
+        AddrToInsn[Insns[I].Addr] = I;
     }
 
     QSet<Address> BlockStarts;
     BlockStarts.insert(Func.Start);
 
     for (const auto& Insn : Insns) {
+        if (Insn.IsJump || Insn.IsConditional || Insn.IsCall) {
+            Address NextAddr = Insn.Addr + Insn.Size;
+            if (NextAddr >= Func.Start && NextAddr < Func.End && AddrToInsn.contains(NextAddr)) {
+                BlockStarts.insert(NextAddr);
+            }
+        }
+
         if (Insn.IsJump || Insn.IsConditional) {
             if (Insn.BranchTarget >= Func.Start && Insn.BranchTarget < Func.End) {
                 BlockStarts.insert(Insn.BranchTarget);
             }
-            Address Next = Insn.Addr + Insn.Size;
-            if (Next >= Func.Start && Next < Func.End) {
-                BlockStarts.insert(Next);
+        }
+    }
+
+    QList<Address> SortedStarts = BlockStarts.values();
+    std::sort(SortedStarts.begin(), SortedStarts.end());
+
+    QMap<Address, int> BlockIndex;
+    for (int I = 0; I < SortedStarts.size(); ++I) {
+        BlockIndex[SortedStarts[I]] = I;
+    }
+
+    for (int B = 0; B < SortedStarts.size(); ++B) {
+        BasicBlock Block;
+        Block.Start = SortedStarts[B];
+
+        Address BlockEnd = (B + 1 < SortedStarts.size()) ? SortedStarts[B + 1] : Func.End;
+
+        int InsnCount = 0;
+        AnalyzedInstruction LastInsn;
+        bool FoundLast = false;
+        for (const auto& Insn : Insns) {
+            if (Insn.Addr < Block.Start) continue;
+            if (Insn.Addr >= BlockEnd) break;
+            InsnCount++;
+            LastInsn = Insn;
+            FoundLast = true;
+        }
+
+        if (!FoundLast) {
+            Block.End = Block.Start;
+            Block.InstructionCount = 0;
+            Func.Blocks.append(Block);
+            continue;
+        }
+
+        Block.End = LastInsn.Addr + LastInsn.Size;
+        Block.InstructionCount = InsnCount;
+
+        if (LastInsn.IsRet || LastInsn.IsHalt) {
+        } else if (LastInsn.IsJump && !LastInsn.IsConditional) {
+            if (LastInsn.BranchTarget >= Func.Start && LastInsn.BranchTarget < Func.End &&
+                BlockIndex.contains(LastInsn.BranchTarget)) {
+                Block.Successors.append(LastInsn.BranchTarget);
+            }
+        } else if (LastInsn.IsConditional) {
+            if (LastInsn.BranchTarget >= Func.Start && LastInsn.BranchTarget < Func.End &&
+                BlockIndex.contains(LastInsn.BranchTarget)) {
+                Block.Successors.append(LastInsn.BranchTarget);
+            }
+            Address FallAddr = LastInsn.Addr + LastInsn.Size;
+            if (FallAddr >= Func.Start && FallAddr < Func.End && BlockIndex.contains(FallAddr)) {
+                Block.Successors.append(FallAddr);
+            }
+        } else {
+            Address FallAddr = LastInsn.Addr + LastInsn.Size;
+            if (FallAddr >= Func.Start && FallAddr < Func.End && BlockIndex.contains(FallAddr)) {
+                Block.Successors.append(FallAddr);
+            }
+        }
+
+        Func.Blocks.append(Block);
+    }
+
+    for (int I = 0; I < Func.Blocks.size(); ++I) {
+        Address BlockAddr = Func.Blocks[I].Start;
+        for (Address Succ : Func.Blocks[I].Successors) {
+            if (BlockIndex.contains(Succ)) {
+                int SuccIdx = BlockIndex[Succ];
+                if (SuccIdx < Func.Blocks.size()) {
+                    if (!Func.Blocks[SuccIdx].Predecessors.contains(BlockAddr)) {
+                        Func.Blocks[SuccIdx].Predecessors.append(BlockAddr);
+                    }
+                }
+            }
+        }
+    }
+}
+
+void AnalysisWorker::ComputeDominance(AnalyzedFunction& Func) {
+    if (Func.Blocks.isEmpty()) return;
+
+    int N = Func.Blocks.size();
+    QMap<Address, int> BlockIdx;
+    for (int I = 0; I < N; ++I) {
+        BlockIdx[Func.Blocks[I].Start] = I;
+    }
+
+    QList<int> ReversePostOrder;
+    {
+        QList<bool> VisitedDom(N, false);
+        QList<int> Stack;
+        QList<int> EntryStack;
+        EntryStack.append(0);
+        VisitedDom[0] = true;
+        while (!EntryStack.isEmpty()) {
+            int Cur = EntryStack.takeLast();
+            Stack.append(Cur);
+            for (Address Succ : Func.Blocks[Cur].Successors) {
+                if (!BlockIdx.contains(Succ)) continue;
+                int SIdx = BlockIdx[Succ];
+                if (!VisitedDom[SIdx]) {
+                    VisitedDom[SIdx] = true;
+                    EntryStack.append(SIdx);
+                }
+            }
+        }
+
+        QList<bool> Finished(N, false);
+        QList<int> DfsStack;
+        QList<int> ChildIdx(N, 0);
+        DfsStack.append(0);
+        std::fill(VisitedDom.begin(), VisitedDom.end(), false);
+        VisitedDom[0] = true;
+
+        while (!DfsStack.isEmpty()) {
+            int Cur = DfsStack.last();
+            const auto& Succs = Func.Blocks[Cur].Successors;
+            bool Pushed = false;
+            while (ChildIdx[Cur] < Succs.size()) {
+                Address SuccAddr = Succs[ChildIdx[Cur]];
+                ChildIdx[Cur]++;
+                if (!BlockIdx.contains(SuccAddr)) continue;
+                int SIdx = BlockIdx[SuccAddr];
+                if (!VisitedDom[SIdx]) {
+                    VisitedDom[SIdx] = true;
+                    DfsStack.append(SIdx);
+                    Pushed = true;
+                    break;
+                }
+            }
+            if (!Pushed) {
+                DfsStack.removeLast();
+                ReversePostOrder.prepend(Cur);
             }
         }
     }
 
-    Func.BasicBlockCount = BlockStarts.size();
+    QList<int> Idom(N, -1);
+    QList<int> RpoIndex(N, -1);
+    for (int I = 0; I < ReversePostOrder.size(); ++I) {
+        RpoIndex[ReversePostOrder[I]] = I;
+    }
+    Idom[0] = 0;
+
+    auto Intersect = [&](int B1, int B2) -> int {
+        int F1 = B1, F2 = B2;
+        while (F1 != F2) {
+            while (RpoIndex[F1] > RpoIndex[F2]) F1 = Idom[F1];
+            while (RpoIndex[F2] > RpoIndex[F1]) F2 = Idom[F2];
+        }
+        return F1;
+    };
+
+    bool Changed = true;
+    while (Changed) {
+        Changed = false;
+        for (int RpoI = 1; RpoI < ReversePostOrder.size(); ++RpoI) {
+            int B = ReversePostOrder[RpoI];
+            int NewIdom = -1;
+
+            for (Address PredAddr : Func.Blocks[B].Predecessors) {
+                if (!BlockIdx.contains(PredAddr)) continue;
+                int P = BlockIdx[PredAddr];
+                if (Idom[P] == -1) continue;
+                if (NewIdom == -1) {
+                    NewIdom = P;
+                } else {
+                    NewIdom = Intersect(P, NewIdom);
+                }
+            }
+
+            if (NewIdom != -1 && Idom[B] != NewIdom) {
+                Idom[B] = NewIdom;
+                Changed = true;
+            }
+        }
+    }
+
+    for (int I = 0; I < N; ++I) {
+        if (Idom[I] >= 0 && Idom[I] < N) {
+            Func.Blocks[I].ImmDominator = Func.Blocks[Idom[I]].Start;
+        }
+
+        int Depth = 0;
+        int Cur = I;
+        while (Cur != 0 && Idom[Cur] >= 0 && Idom[Cur] != Cur && Depth < N) {
+            Depth++;
+            Cur = Idom[Cur];
+        }
+        Func.Blocks[I].DominanceDepth = Depth;
+    }
+}
+
+void AnalysisWorker::DetectLoops(AnalyzedFunction& Func) {
+    if (Func.Blocks.isEmpty()) return;
+
+    QMap<Address, int> BlockIdx;
+    for (int I = 0; I < Func.Blocks.size(); ++I) {
+        BlockIdx[Func.Blocks[I].Start] = I;
+    }
+
+    Func.LoopCount = 0;
+    for (int I = 0; I < Func.Blocks.size(); ++I) {
+        for (Address Succ : Func.Blocks[I].Successors) {
+            if (!BlockIdx.contains(Succ)) continue;
+            int SuccIdx = BlockIdx[Succ];
+
+            int Cur = I;
+            bool Dominates = false;
+            int Safety = 0;
+            while (Cur >= 0 && Safety < Func.Blocks.size()) {
+                if (Cur == SuccIdx) { Dominates = true; break; }
+                if (Cur == 0) break;
+                int NextCur = -1;
+                Address DomAddr = Func.Blocks[Cur].ImmDominator;
+                if (BlockIdx.contains(DomAddr)) NextCur = BlockIdx[DomAddr];
+                if (NextCur == Cur) break;
+                Cur = NextCur;
+                Safety++;
+            }
+
+            if (Dominates) {
+                Func.Blocks[SuccIdx].IsLoopHeader = true;
+                Func.LoopCount++;
+            }
+        }
+    }
+}
+
+int AnalysisWorker::ComputeStackFrameEquation(const QList<AnalyzedInstruction>& Insns, const QList<BasicBlock>& Blocks) {
+    int MaxFrame = 0;
+    int CurrentSp = 0;
+    bool FoundSub = false;
+
+    for (const auto& Insn : Insns) {
+        if (Insn.Addr > (Insns.isEmpty() ? 0 : Insns.first().Addr) + 256) break;
+
+        QString Mn = Insn.Mnemonic.toLower();
+        QString Op = Insn.Operands.toLower();
+
+        if (Mn == "sub" && (Op.startsWith("rsp,") || Op.startsWith("esp,"))) {
+            QString ValStr = Op.mid(Op.indexOf(',') + 1).trimmed();
+            int Val = 0;
+            if (ValStr.startsWith("0x")) {
+                Val = ValStr.mid(2).toInt(nullptr, 16);
+            } else {
+                Val = ValStr.toInt();
+            }
+            CurrentSp += Val;
+            if (CurrentSp > MaxFrame) MaxFrame = CurrentSp;
+            FoundSub = true;
+        }
+
+        if (Mn == "add" && (Op.startsWith("rsp,") || Op.startsWith("esp,"))) {
+            QString ValStr = Op.mid(Op.indexOf(',') + 1).trimmed();
+            int Val = 0;
+            if (ValStr.startsWith("0x")) {
+                Val = ValStr.mid(2).toInt(nullptr, 16);
+            } else {
+                Val = ValStr.toInt();
+            }
+            CurrentSp -= Val;
+        }
+
+        if (Mn == "push") {
+            CurrentSp += 8;
+            if (CurrentSp > MaxFrame) MaxFrame = CurrentSp;
+        }
+
+        if (Mn == "pop") {
+            CurrentSp -= 8;
+        }
+
+        if (Mn == "and" && (Op.startsWith("rsp,") || Op.startsWith("esp,"))) {
+            FoundSub = true;
+        }
+
+        if (Mn == "lea" && (Op.startsWith("rsp,") || Op.startsWith("esp,"))) {
+            QRegularExpression Re("\\[(?:rbp|ebp)\\s*-\\s*(?:0x)?([0-9a-fA-F]+)\\]");
+            auto Match = Re.match(Op);
+            if (Match.hasMatch()) {
+                int FrameVal = Match.captured(1).toInt(nullptr, 16);
+                if (FrameVal > MaxFrame) MaxFrame = FrameVal;
+                FoundSub = true;
+            }
+        }
+
+        if (FoundSub && (Mn == "mov" || Mn == "lea") && !Op.contains("rsp") && !Op.contains("esp")) {
+            QRegularExpression Re("\\[(?:rsp|esp)\\s*[+\\-]\\s*(?:0x)?([0-9a-fA-F]+)\\]");
+            auto Match = Re.match(Op);
+            if (Match.hasMatch()) {
+                int Off = Match.captured(1).toInt(nullptr, 16);
+                if (Off > MaxFrame) MaxFrame = Off;
+            }
+        }
+
+        if (Insn.IsCall || Insn.IsRet) break;
+    }
+
+    return MaxFrame;
+}
+
+CallingConvention AnalysisWorker::DetectCallingConvention(const QList<AnalyzedInstruction>& Insns, bool Is64Bit) {
+    if (Insns.isEmpty()) return CallingConvention::Unknown;
+    if (!Is64Bit) {
+        bool UsesBpFrame = false;
+        bool HasStdcallRet = false;
+        bool UsesEcx = false;
+
+        for (const auto& Insn : Insns) {
+            if (Insn.Addr > Insns.first().Addr + 128) break;
+            QString Mn = Insn.Mnemonic.toLower();
+            QString Op = Insn.Operands.toLower();
+
+            if (Mn == "mov" && Op == "ebp, esp") UsesBpFrame = true;
+            if (Mn == "push" && Op == "ebp") UsesBpFrame = true;
+
+            if (Mn == "ret" && !Op.isEmpty()) {
+                HasStdcallRet = true;
+            }
+
+            if (Op.contains("ecx") && !Op.contains("[ecx")) {
+                if (Mn == "mov" || Mn == "test" || Mn == "cmp") UsesEcx = true;
+            }
+        }
+
+        if (HasStdcallRet) {
+            if (UsesEcx) return CallingConvention::Thiscall;
+            return CallingConvention::Stdcall;
+        }
+
+        return CallingConvention::Cdecl;
+    }
+
+    bool UsesRdi = false, UsesRsi = false;
+    bool UsesRcx = false, UsesRdx = false;
+    bool StoresRcxHome = false, StoresRdxHome = false;
+
+    for (const auto& Insn : Insns) {
+        if (Insn.Addr > Insns.first().Addr + 64) break;
+        QString Mn = Insn.Mnemonic.toLower();
+        QString Op = Insn.Operands.toLower();
+
+        if (Mn == "mov" && Op.contains("[rsp") && Op.contains("rcx")) StoresRcxHome = true;
+        if (Mn == "mov" && Op.contains("[rsp") && Op.contains("rdx")) StoresRdxHome = true;
+
+        if (Op.contains("rdi") || Op.contains("edi")) UsesRdi = true;
+        if (Op.contains("rsi") || Op.contains("esi")) UsesRsi = true;
+        if (Op.contains("rcx") || Op.contains("ecx")) UsesRcx = true;
+        if (Op.contains("rdx") || Op.contains("edx")) UsesRdx = true;
+    }
+
+    if (StoresRcxHome || StoresRdxHome) return CallingConvention::Win64;
+
+    if (UsesRdi && UsesRsi && !StoresRcxHome) return CallingConvention::SysVAmd64;
+
+    if (UsesRcx && !UsesRdi) return CallingConvention::Win64;
+    if (UsesRdi && !UsesRcx) return CallingConvention::SysVAmd64;
+
+    return CallingConvention::Unknown;
+}
+
+int AnalysisWorker::DetectArgCount(const QList<AnalyzedInstruction>& Insns, bool Is64Bit, CallingConvention Conv) {
+    if (Insns.isEmpty()) return 0;
+
+    if (Is64Bit) {
+        if (Conv == CallingConvention::Win64 || Conv == CallingConvention::Unknown) {
+            bool UsesRcx = false, UsesRdx = false, UsesR8 = false, UsesR9 = false;
+            QSet<QString> WrittenRegs;
+
+            for (const auto& Insn : Insns) {
+                if (Insn.Addr > Insns.first().Addr + 96) break;
+                QString Mn = Insn.Mnemonic.toLower();
+                QString Op = Insn.Operands.toLower();
+
+                QStringList Parts = Op.split(',');
+                if (Parts.size() >= 2 && Mn == "mov") {
+                    QString Dst = Parts[0].trimmed();
+                    if (Dst == "rcx" || Dst == "ecx") WrittenRegs.insert("rcx");
+                    if (Dst == "rdx" || Dst == "edx") WrittenRegs.insert("rdx");
+                    if (Dst == "r8" || Dst == "r8d") WrittenRegs.insert("r8");
+                    if (Dst == "r9" || Dst == "r9d") WrittenRegs.insert("r9");
+                }
+
+                if (!WrittenRegs.contains("rcx") && (Op.contains("rcx") || Op.contains("ecx"))) UsesRcx = true;
+                if (!WrittenRegs.contains("rdx") && (Op.contains("rdx") || Op.contains("edx"))) UsesRdx = true;
+                if (!WrittenRegs.contains("r8") && Op.contains("r8")) UsesR8 = true;
+                if (!WrittenRegs.contains("r9") && Op.contains("r9")) UsesR9 = true;
+
+                if (Insn.IsCall) break;
+            }
+
+            if (UsesR9) return 4;
+            if (UsesR8) return 3;
+            if (UsesRdx) return 2;
+            if (UsesRcx) return 1;
+            return 0;
+        }
+
+        if (Conv == CallingConvention::SysVAmd64) {
+            bool UsesRdi = false, UsesRsi = false, UsesRdx = false;
+            bool UsesRcx = false, UsesR8 = false, UsesR9 = false;
+            QSet<QString> WrittenRegs;
+
+            for (const auto& Insn : Insns) {
+                if (Insn.Addr > Insns.first().Addr + 96) break;
+                QString Mn = Insn.Mnemonic.toLower();
+                QString Op = Insn.Operands.toLower();
+
+                QStringList Parts = Op.split(',');
+                if (Parts.size() >= 2 && Mn == "mov") {
+                    QString Dst = Parts[0].trimmed();
+                    if (Dst == "rdi" || Dst == "edi") WrittenRegs.insert("rdi");
+                    if (Dst == "rsi" || Dst == "esi") WrittenRegs.insert("rsi");
+                    if (Dst == "rdx" || Dst == "edx") WrittenRegs.insert("rdx");
+                    if (Dst == "rcx" || Dst == "ecx") WrittenRegs.insert("rcx");
+                    if (Dst == "r8" || Dst == "r8d") WrittenRegs.insert("r8");
+                    if (Dst == "r9" || Dst == "r9d") WrittenRegs.insert("r9");
+                }
+
+                if (!WrittenRegs.contains("rdi") && (Op.contains("rdi") || Op.contains("edi"))) UsesRdi = true;
+                if (!WrittenRegs.contains("rsi") && (Op.contains("rsi") || Op.contains("esi"))) UsesRsi = true;
+                if (!WrittenRegs.contains("rdx") && (Op.contains("rdx") || Op.contains("edx"))) UsesRdx = true;
+                if (!WrittenRegs.contains("rcx") && (Op.contains("rcx") || Op.contains("ecx"))) UsesRcx = true;
+                if (!WrittenRegs.contains("r8") && Op.contains("r8")) UsesR8 = true;
+                if (!WrittenRegs.contains("r9") && Op.contains("r9")) UsesR9 = true;
+
+                if (Insn.IsCall) break;
+            }
+
+            if (UsesR9) return 6;
+            if (UsesR8) return 5;
+            if (UsesRcx) return 4;
+            if (UsesRdx) return 3;
+            if (UsesRsi) return 2;
+            if (UsesRdi) return 1;
+            return 0;
+        }
+    }
+
+    int MaxArgOffset = 0;
+    for (const auto& Insn : Insns) {
+        if (Insn.Addr > Insns.first().Addr + 128) break;
+        QString Op = Insn.Operands.toLower();
+        QRegularExpression Re("\\[ebp\\s*\\+\\s*(?:0x)?([0-9a-f]+)\\]");
+        auto Match = Re.match(Op);
+        if (Match.hasMatch()) {
+            int Off = Match.captured(1).toInt(nullptr, 16);
+            if (Off >= 8 && Off < 0x100) {
+                int ArgIdx = (Off - 8) / 4 + 1;
+                if (ArgIdx > MaxArgOffset) MaxArgOffset = ArgIdx;
+            }
+        }
+    }
+    return MaxArgOffset;
 }
 
 void AnalysisWorker::RunLinearSweep() {
@@ -2045,6 +2662,8 @@ void AnalysisWorker::RunLinearSweep() {
         if (Cancelled.loadRelaxed()) return;
         if (Seg.Type != SegmentType::Code) continue;
         if (Seg.Data.isEmpty()) continue;
+
+        CurrentSectionName = Seg.Name;
 
         const uint8_t* SData = reinterpret_cast<const uint8_t*>(Seg.Data.constData());
         size_t SSize = static_cast<size_t>(Seg.Data.size());
@@ -2742,6 +3361,26 @@ void AnalysisWorker::ResolveJumpTables() {
     int PtrSize = Info.Is64Bit ? 8 : 4;
     int JumpTableEntries = 0;
 
+    auto IsCodeAddr = [&](uint64_t Addr) -> bool {
+        for (const Segment& CodeSeg : Info.Segments) {
+            if (CodeSeg.Type != SegmentType::Code && !CodeSeg.IsExecutable) continue;
+            if (Addr >= CodeSeg.VirtualAddress && Addr < CodeSeg.VirtualAddress + CodeSeg.VirtualSize) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto AddTarget = [&](Address Target) {
+        if (!Db->HasInstruction(Target)) {
+            QMutexLocker Locker(&QueueMutex);
+            if (!VisitedMT.contains(Target) && !QueuedSetMT.contains(Target)) {
+                AddDisassemblyTargetMT(Target);
+                JumpTableEntries++;
+            }
+        }
+    };
+
     for (const Segment& Seg : Info.Segments) {
         if (Cancelled.loadRelaxed()) return;
         if (Seg.Type != SegmentType::Code && !Seg.IsExecutable) continue;
@@ -2749,52 +3388,118 @@ void AnalysisWorker::ResolveJumpTables() {
         QList<AnalyzedInstruction> Insns = Db->GetInstructions(
             Seg.VirtualAddress, Seg.VirtualAddress + Seg.VirtualSize);
 
-        for (const auto& Insn : Insns) {
+        for (int InsnIdx = 0; InsnIdx < Insns.size(); ++InsnIdx) {
             if (Cancelled.loadRelaxed()) return;
+            const auto& Insn = Insns[InsnIdx];
             if (!Insn.IsJump || Insn.IsConditional) continue;
             if (Insn.BranchTarget != 0) continue;
-            if (Insn.MemoryRef == 0) continue;
 
-            Address TableBase = Insn.MemoryRef;
-            if (!Db->IsAddressValid(TableBase)) continue;
+            if (Insn.MemoryRef != 0 && Db->IsAddressValid(Insn.MemoryRef)) {
+                Address TableBase = Insn.MemoryRef;
 
-            for (int EntryIdx = 0; EntryIdx < 256; ++EntryIdx) {
-                Address EntryAddr = TableBase + EntryIdx * PtrSize;
-                QByteArray PtrBytes = Db->ReadBytes(EntryAddr, PtrSize);
-                if (PtrBytes.size() < PtrSize) break;
+                for (int EntryIdx = 0; EntryIdx < 4096; ++EntryIdx) {
+                    Address EntryAddr = TableBase + EntryIdx * PtrSize;
+                    QByteArray PtrBytes = Db->ReadBytes(EntryAddr, PtrSize);
+                    if (PtrBytes.size() < PtrSize) break;
 
-                uint64_t Target = 0;
-                if (PtrSize == 8) {
-                    std::memcpy(&Target, PtrBytes.constData(), 8);
-                } else {
-                    uint32_t Val32 = 0;
-                    std::memcpy(&Val32, PtrBytes.constData(), 4);
-                    Target = Val32;
+                    uint64_t Target = 0;
+                    if (PtrSize == 8) {
+                        std::memcpy(&Target, PtrBytes.constData(), 8);
+                    } else {
+                        uint32_t Val32 = 0;
+                        std::memcpy(&Val32, PtrBytes.constData(), 4);
+                        Target = Val32;
+                    }
+
+                    if (Target == 0) break;
+                    if (!IsCodeAddr(Target)) break;
+                    AddTarget(static_cast<Address>(Target));
                 }
+                continue;
+            }
 
-                if (Target == 0) break;
+            if (!Insn.IsIndirectJump) continue;
 
-                bool InCode = false;
-                for (const Segment& CodeSeg : Info.Segments) {
-                    if (CodeSeg.Type != SegmentType::Code && !CodeSeg.IsExecutable) continue;
-                    if (Target >= CodeSeg.VirtualAddress && Target < CodeSeg.VirtualAddress + CodeSeg.VirtualSize) {
-                        InCode = true;
-                        break;
+            int GuardTableSize = 0;
+            Address LeaBase = 0;
+            Address RelTableAddr = 0;
+
+            for (int Back = InsnIdx - 1; Back >= 0 && Back >= InsnIdx - 12; --Back) {
+                const auto& PrevInsn = Insns[Back];
+                QString PrevMn = PrevInsn.Mnemonic.toLower();
+                QString PrevOp = PrevInsn.Operands.toLower();
+
+                if (GuardTableSize == 0 && (PrevMn == "cmp" || PrevMn == "test")) {
+                    QRegularExpression CmpRe("(?:0x)?([0-9a-fA-F]+)");
+                    auto CmpMatch = CmpRe.match(PrevOp);
+                    if (CmpMatch.hasMatch()) {
+                        int Val = CmpMatch.captured(1).toInt(nullptr, 16);
+                        if (Val > 0 && Val <= 4096) {
+                            GuardTableSize = Val + 1;
+                        }
                     }
                 }
 
-                if (!InCode) break;
-
-                if (!Db->HasInstruction(Target)) {
-                    QMutexLocker Locker(&QueueMutex);
-                    if (!VisitedMT.contains(Target) && !QueuedSetMT.contains(Target)) {
-                        AddDisassemblyTargetMT(Target);
-                        JumpTableEntries++;
+                if (PrevMn == "lea" && PrevInsn.MemoryRef != 0) {
+                    if (PrevOp.contains("[rip")) {
+                        LeaBase = PrevInsn.MemoryRef;
                     }
+                }
+
+                if (PrevMn == "movsxd" || (PrevMn == "mov" && PrevOp.contains("dword"))) {
+                    if (PrevInsn.MemoryRef != 0) {
+                        RelTableAddr = PrevInsn.MemoryRef;
+                    }
+                }
+            }
+
+            if (RelTableAddr != 0 && LeaBase != 0 && Db->IsAddressValid(RelTableAddr)) {
+                int MaxEntries = GuardTableSize > 0 ? GuardTableSize : 1024;
+
+                for (int EntryIdx = 0; EntryIdx < MaxEntries; ++EntryIdx) {
+                    Address EntryAddr = RelTableAddr + EntryIdx * 4;
+                    QByteArray OffBytes = Db->ReadBytes(EntryAddr, 4);
+                    if (OffBytes.size() < 4) break;
+
+                    int32_t RelOffset = 0;
+                    std::memcpy(&RelOffset, OffBytes.constData(), 4);
+
+                    uint64_t Target = LeaBase + RelOffset;
+
+                    if (!IsCodeAddr(Target)) {
+                        if (EntryIdx == 0) break;
+                        continue;
+                    }
+
+                    AddTarget(static_cast<Address>(Target));
+                }
+            } else if (RelTableAddr != 0 && LeaBase == 0 && Db->IsAddressValid(RelTableAddr)) {
+                Address FuncContaining = 0;
+                AnalyzedFunction ContFunc = Db->GetFunctionContaining(Insn.Addr);
+                if (ContFunc.Start != 0) FuncContaining = ContFunc.Start;
+
+                int MaxEntries = GuardTableSize > 0 ? GuardTableSize : 1024;
+                for (int EntryIdx = 0; EntryIdx < MaxEntries; ++EntryIdx) {
+                    Address EntryAddr = RelTableAddr + EntryIdx * 4;
+                    QByteArray OffBytes = Db->ReadBytes(EntryAddr, 4);
+                    if (OffBytes.size() < 4) break;
+
+                    int32_t RelOffset = 0;
+                    std::memcpy(&RelOffset, OffBytes.constData(), 4);
+
+                    uint64_t Target = RelTableAddr + RelOffset;
+                    if (!IsCodeAddr(Target)) {
+                        Target = Insn.Addr + RelOffset;
+                        if (!IsCodeAddr(Target)) break;
+                    }
+
+                    AddTarget(static_cast<Address>(Target));
                 }
             }
         }
     }
+
+    ResolveRelativeJumpTables(Info);
 
     if (JumpTableEntries > 0) {
         emit LogMessage(QString("Jump table scan: %1 new code targets").arg(JumpTableEntries));
@@ -2809,7 +3514,7 @@ void AnalysisWorker::ResolveJumpTables() {
         QList<QFuture<void>> Futures;
         for (int T = 0; T < NumThreads; ++T) {
             QFuture<void> Future = QtConcurrent::run([this, CsArch, CsMode]() {
-            QThread::currentThread()->setPriority(QThread::LowPriority);
+                QThread::currentThread()->setPriority(QThread::LowPriority);
                 csh Handle;
                 if (cs_open(CsArch, CsMode, &Handle) != CS_ERR_OK) return;
                 cs_option(Handle, CS_OPT_DETAIL, CS_OPT_ON);
@@ -2838,6 +3543,62 @@ void AnalysisWorker::ResolveJumpTables() {
         for (auto& F : Futures) F.waitForFinished();
     } else {
         emit LogMessage("Jump table scan: no tables found");
+    }
+}
+
+void AnalysisWorker::ResolveRelativeJumpTables(const BinaryInfo& Info) {
+    if (!Info.Is64Bit) return;
+
+    for (const Segment& Seg : Info.Segments) {
+        if (Cancelled.loadRelaxed()) return;
+        if (Seg.Type == SegmentType::Code || Seg.IsExecutable) continue;
+        if (Seg.Data.isEmpty()) continue;
+        if (!Seg.Name.contains(".rdata") && !Seg.Name.contains(".rodata") && !Seg.Name.contains(".text")) continue;
+
+        const uint8_t* SData = reinterpret_cast<const uint8_t*>(Seg.Data.constData());
+        size_t SSize = static_cast<size_t>(Seg.Data.size());
+
+        for (size_t Off = 0; Off + 16 <= SSize; Off += 4) {
+            int ConsecutiveCode = 0;
+            Address TableAddr = Seg.VirtualAddress + Off;
+
+            for (int E = 0; E < 8; ++E) {
+                if (Off + E * 4 + 4 > SSize) break;
+                int32_t RelOff = 0;
+                std::memcpy(&RelOff, SData + Off + E * 4, 4);
+
+                int64_t AbsAddr = static_cast<int64_t>(TableAddr) + RelOff;
+                if (AbsAddr > 0 && Db->IsCodeAddress(static_cast<Address>(AbsAddr))) {
+                    ConsecutiveCode++;
+                } else {
+                    break;
+                }
+            }
+
+            if (ConsecutiveCode >= 3) {
+                QList<Xref> Refs = Db->GetXrefsTo(TableAddr);
+                if (Refs.isEmpty()) continue;
+
+                for (int E = 0; E < 4096; ++E) {
+                    if (Off + E * 4 + 4 > SSize) break;
+                    int32_t RelOff = 0;
+                    std::memcpy(&RelOff, SData + Off + E * 4, 4);
+
+                    int64_t AbsAddr = static_cast<int64_t>(TableAddr) + RelOff;
+                    if (AbsAddr <= 0 || !Db->IsCodeAddress(static_cast<Address>(AbsAddr))) break;
+
+                    Address Target = static_cast<Address>(AbsAddr);
+                    if (!Db->HasInstruction(Target)) {
+                        QMutexLocker Locker(&QueueMutex);
+                        if (!VisitedMT.contains(Target) && !QueuedSetMT.contains(Target)) {
+                            AddDisassemblyTargetMT(Target);
+                        }
+                    }
+                }
+
+                Off += ConsecutiveCode * 4 - 4;
+            }
+        }
     }
 }
 
@@ -2985,12 +3746,20 @@ void AnalysisWorker::DetectNonReturning() {
     QSet<QString> KnownNoReturn;
     KnownNoReturn.insert("exit");
     KnownNoReturn.insert("_exit");
+    KnownNoReturn.insert("_Exit");
+    KnownNoReturn.insert("quick_exit");
     KnownNoReturn.insert("abort");
     KnownNoReturn.insert("__assert_fail");
+    KnownNoReturn.insert("__assert_rtn");
+    KnownNoReturn.insert("__assert");
     KnownNoReturn.insert("__stack_chk_fail");
     KnownNoReturn.insert("__fortify_fail");
     KnownNoReturn.insert("__cxa_throw");
     KnownNoReturn.insert("__cxa_rethrow");
+    KnownNoReturn.insert("__cxa_bad_cast");
+    KnownNoReturn.insert("__cxa_bad_typeid");
+    KnownNoReturn.insert("__cxa_pure_virtual");
+    KnownNoReturn.insert("__cxa_deleted_virtual");
     KnownNoReturn.insert("longjmp");
     KnownNoReturn.insert("__longjmp_chk");
     KnownNoReturn.insert("siglongjmp");
@@ -2999,12 +3768,33 @@ void AnalysisWorker::DetectNonReturning() {
     KnownNoReturn.insert("verr");
     KnownNoReturn.insert("verrx");
     KnownNoReturn.insert("__libc_fatal");
-    KnownNoReturn.insert("__assert_rtn");
+    KnownNoReturn.insert("__libc_message");
+    KnownNoReturn.insert("__chk_fail");
+    KnownNoReturn.insert("__overflow_handler");
     KnownNoReturn.insert("ExitProcess");
     KnownNoReturn.insert("TerminateProcess");
+    KnownNoReturn.insert("TerminateThread");
     KnownNoReturn.insert("RaiseException");
+    KnownNoReturn.insert("RaiseFailFastException");
     KnownNoReturn.insert("FatalExit");
+    KnownNoReturn.insert("FatalAppExitA");
+    KnownNoReturn.insert("FatalAppExitW");
     KnownNoReturn.insert("_CxxThrowException");
+    KnownNoReturn.insert("_amsg_exit");
+    KnownNoReturn.insert("_invoke_watson");
+    KnownNoReturn.insert("_invalid_parameter_noinfo_noreturn");
+    KnownNoReturn.insert("__report_rangecheckfailure");
+    KnownNoReturn.insert("__fastfail");
+    KnownNoReturn.insert("__debugbreak");
+    KnownNoReturn.insert("NtTerminateProcess");
+    KnownNoReturn.insert("ZwTerminateProcess");
+    KnownNoReturn.insert("RtlFailFast");
+    KnownNoReturn.insert("KeBugCheck");
+    KnownNoReturn.insert("KeBugCheckEx");
+    KnownNoReturn.insert("__ubsan_handle_builtin_unreachable");
+    KnownNoReturn.insert("__builtin_unreachable");
+    KnownNoReturn.insert("panic");
+    KnownNoReturn.insert("unreachable");
 
     QSet<Address> NoReturnAddrs;
     QList<AnalyzedFunction> AllFuncs = Db->GetAllFunctions();
@@ -5034,7 +5824,7 @@ void AnalysisWorker::DetectPackerCompiler() {
     if (!Info.Compiler.isEmpty()) DetectionParts.append("compiler=" + Info.Compiler);
     if (!Info.Packer.isEmpty()) DetectionParts.append("packer=" + Info.Packer);
     if (Info.IsPacked) DetectionParts.append("packed=true");
-    if (MaxEntropy > 0) DetectionParts.append(QString("max_entropy=%.2f in %1").arg(MaxEntropy).arg(MaxEntropySeg));
+    if (MaxEntropy > 0) DetectionParts.append(QString("max_entropy=%1 in %2").arg(MaxEntropy, 0, 'f', 2).arg(MaxEntropySeg));
 
     if (DetectionParts.isEmpty()) {
         emit LogMessage("Packer/compiler detection: nothing detected");
@@ -5052,6 +5842,9 @@ void AnalysisWorker::EmitProgress(AnalysisState State, int Percentage, const QSt
     Progress.InstructionsDisassembled = Db->InstructionCount();
     Progress.StringsFound = Db->StringCount();
     Progress.XrefsBuilt = Db->XrefCount();
+    Progress.CurrentSection = CurrentSectionName;
+    Progress.CurrentAddress = CurrentAnalysisAddr;
+    Progress.ElapsedMs = AnalysisTimer.elapsed();
     emit ProgressChanged(Progress);
 }
 

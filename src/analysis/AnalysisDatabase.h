@@ -4,10 +4,14 @@
 #include <QObject>
 #include <QMap>
 #include <QMultiMap>
+#include <QHash>
 #include <QSet>
 #include <QReadWriteLock>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <QAtomicInt>
+#include <vector>
+#include <atomic>
 
 namespace Fidra {
 
@@ -64,6 +68,8 @@ public:
     bool IsCodeAddress(Address Addr) const;
     bool IsDataAddress(Address Addr) const;
     bool IsAddressValid(Address Addr) const;
+    void BuildSegmentCache();
+    void BuildInstructionIndex();
 
     QByteArray ReadBytes(Address Addr, size_t Size) const;
 
@@ -76,16 +82,29 @@ signals:
     void AnalysisUpdated();
 
 private:
+    const Segment* FindSegmentCached(Address Addr) const;
+
     mutable QReadWriteLock Lock;
+    mutable QReadWriteLock InsnLock;
     BinaryInfo Binary;
-    QMap<Address, AnalyzedInstruction> Instructions;
+    QHash<Address, AnalyzedInstruction> Instructions;
     QMap<Address, AnalyzedFunction> Functions;
     QMultiMap<Address, Xref> XrefsTo;
     QMultiMap<Address, Xref> XrefsFrom;
     QMap<Address, AnalyzedString> Strings;
-    QMap<Address, ItemType> ItemTypes;
+    QHash<Address, ItemType> ItemTypes;
     QMap<Address, QString> Names;
     QMap<Address, QString> Comments;
+
+    struct SegmentRange {
+        Address Start;
+        Address End;
+        int Index;
+    };
+    std::vector<SegmentRange> SortedSegments;
+
+    std::vector<Address> SortedInsnAddrs;
+    bool InsnIndexBuilt = false;
 };
 
 }

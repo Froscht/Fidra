@@ -52,6 +52,16 @@ enum class AnalysisState {
     Failed
 };
 
+enum class CallingConvention {
+    Unknown,
+    Cdecl,
+    Stdcall,
+    Fastcall,
+    Thiscall,
+    Win64,
+    SysVAmd64
+};
+
 struct Segment {
     QString Name;
     Address VirtualAddress;
@@ -80,6 +90,9 @@ struct AnalyzedInstruction {
     bool IsNop;
     bool IsPush;
     bool IsPop;
+    bool IsIndirectJump;
+    bool IsIndirectCall;
+    bool IsHalt;
     Address BranchTarget;
     Address MemoryRef;
 };
@@ -90,6 +103,9 @@ struct BasicBlock {
     int InstructionCount;
     QList<Address> Successors;
     QList<Address> Predecessors;
+    Address ImmDominator = 0;
+    bool IsLoopHeader = false;
+    int DominanceDepth = 0;
 };
 
 struct AnalyzedFunction {
@@ -107,7 +123,10 @@ struct AnalyzedFunction {
     bool IsThunk;
     bool IsNoReturn = false;
     bool HasExceptionHandler = false;
+    bool HasTailCalls = false;
     Address ExceptionHandler = 0;
+    CallingConvention Convention = CallingConvention::Unknown;
+    int LoopCount = 0;
     QList<Address> Callers;
     QList<Address> Callees;
     QList<BasicBlock> Blocks;
@@ -174,6 +193,9 @@ struct AnalysisProgress {
     int InstructionsDisassembled;
     int StringsFound;
     int XrefsBuilt;
+    QString CurrentSection;
+    Address CurrentAddress = 0;
+    qint64 ElapsedMs = 0;
 };
 
 }
