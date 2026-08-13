@@ -883,7 +883,7 @@ QString DisasmWidget::FormatImmediate(int64_t Value, OperandFormat Fmt) const {
                 return FuncName;
             }
 
-            const Segment* Seg = AnalysisDb->GetSegmentAt(Target);
+            std::optional<Segment> Seg = AnalysisDb->GetSegmentAt(Target);
             if (Seg) {
                 uint64_t SegOffset = Target - Seg->VirtualAddress;
                 return QString("%1:0x%2").arg(Seg->Name).arg(SegOffset, 0, 16).toUpper();
