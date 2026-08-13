@@ -35,8 +35,8 @@ desktop.ini
 
 # Debug
 *.dSYM/
-core
-core.*
+/core
+core.[0-9]*
 vgcore.*
 
 # Package
