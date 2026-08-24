@@ -18,6 +18,7 @@ void AnalysisDatabase::Clear() {
         QWriteLocker Locker(&InsnLock);
         Instructions.clear();
         ItemTypes.clear();
+        LimitWarned = false;
     }
     QWriteLocker Locker(&Lock);
     Binary = BinaryInfo{};
@@ -38,7 +39,7 @@ void AnalysisDatabase::SetBinaryInfo(const BinaryInfo& Info) {
 }
 
 void AnalysisDatabase::BuildSegmentCache() {
-    QReadLocker Locker(&Lock);
+    QWriteLocker Locker(&Lock);
     SortedSegments.clear();
     SortedSegments.reserve(static_cast<size_t>(Binary.Segments.size()));
     for (int I = 0; I < Binary.Segments.size(); ++I) {
@@ -49,17 +50,23 @@ void AnalysisDatabase::BuildSegmentCache() {
         [](const SegmentRange& A, const SegmentRange& B) { return A.Start < B.Start; });
 }
 
-const Segment* AnalysisDatabase::FindSegmentCached(Address Addr) const {
-    if (SortedSegments.empty()) return nullptr;
-    size_t Lo = 0, Hi = SortedSegments.size();
-    while (Lo < Hi) {
-        size_t Mid = Lo + (Hi - Lo) / 2;
-        if (SortedSegments[Mid].End <= Addr)
-            Lo = Mid + 1;
-        else if (SortedSegments[Mid].Start > Addr)
-            Hi = Mid;
-        else
-            return &Binary.Segments[SortedSegments[Mid].Index];
+const Segment* AnalysisDatabase::FindSegmentUnlocked(Address Addr) const {
+    if (!SortedSegments.empty()) {
+        size_t Lo = 0, Hi = SortedSegments.size();
+        while (Lo < Hi) {
+            size_t Mid = Lo + (Hi - Lo) / 2;
+            if (SortedSegments[Mid].End <= Addr)
+                Lo = Mid + 1;
+            else if (SortedSegments[Mid].Start > Addr)
+                Hi = Mid;
+            else
+                return &Binary.Segments[SortedSegments[Mid].Index];
+        }
+        return nullptr;
+    }
+    for (const Segment& Seg : Binary.Segments) {
+        if (Addr >= Seg.VirtualAddress && Addr < Seg.VirtualAddress + Seg.VirtualSize)
+            return &Seg;
     }
     return nullptr;
 }
@@ -71,6 +78,13 @@ BinaryInfo AnalysisDatabase::GetBinaryInfo() const {
 
 void AnalysisDatabase::AddInstruction(const AnalyzedInstruction& Inst) {
     QWriteLocker Locker(&InsnLock);
+    if (Instructions.size() >= MaxInstructions) {
+        if (!LimitWarned) {
+            LimitWarned = true;
+            qWarning("AnalysisDatabase: instruction limit (%d) reached, dropping further instructions", MaxInstructions);
+        }
+        return;
+    }
     Instructions.insert(Inst.Addr, Inst);
 }
 
@@ -118,6 +132,18 @@ QList<AnalyzedInstruction> AnalysisDatabase::GetInstructions(Address Start, Addr
 int AnalysisDatabase::InstructionCount() const {
     QReadLocker Locker(&InsnLock);
     return Instructions.size();
+}
+
+bool AnalysisDatabase::InstructionLimitReached() const {
+    QReadLocker Locker(&InsnLock);
+    return Instructions.size() >= MaxInstructions;
+}
+
+void AnalysisDatabase::ForEachInstruction(const std::function<void(const AnalyzedInstruction&)>& Callback) const {
+    QReadLocker Locker(&InsnLock);
+    for (auto It = Instructions.constBegin(); It != Instructions.constEnd(); ++It) {
+        Callback(It.value());
+    }
 }
 
 void AnalysisDatabase::AddFunction(const AnalyzedFunction& Func) {
@@ -169,6 +195,13 @@ QList<AnalyzedFunction> AnalysisDatabase::GetAllFunctions() const {
     return Functions.values();
 }
 
+void AnalysisDatabase::ForEachFunction(const std::function<void(const AnalyzedFunction&)>& Callback) const {
+    QReadLocker Locker(&Lock);
+    for (auto It = Functions.constBegin(); It != Functions.constEnd(); ++It) {
+        Callback(It.value());
+    }
+}
+
 int AnalysisDatabase::FunctionCount() const {
     QReadLocker Locker(&Lock);
     return Functions.size();
@@ -218,6 +251,13 @@ bool AnalysisDatabase::HasString(Address Addr) const {
 QList<AnalyzedString> AnalysisDatabase::GetAllStrings() const {
     QReadLocker Locker(&Lock);
     return Strings.values();
+}
+
+void AnalysisDatabase::ForEachString(const std::function<void(const AnalyzedString&)>& Callback) const {
+    QReadLocker Locker(&Lock);
+    for (auto It = Strings.constBegin(); It != Strings.constEnd(); ++It) {
+        Callback(It.value());
+    }
 }
 
 int AnalysisDatabase::StringCount() const {
@@ -279,7 +319,7 @@ QMap<Address, QString> AnalysisDatabase::GetAllComments() const {
 }
 
 void AnalysisDatabase::BuildInstructionIndex() {
-    QReadLocker Locker(&InsnLock);
+    QWriteLocker Locker(&InsnLock);
     SortedInsnAddrs.clear();
     SortedInsnAddrs.reserve(static_cast<size_t>(Instructions.size()));
     for (auto It = Instructions.constBegin(); It != Instructions.constEnd(); ++It) {
@@ -289,33 +329,33 @@ void AnalysisDatabase::BuildInstructionIndex() {
     InsnIndexBuilt = true;
 }
 
-const Segment* AnalysisDatabase::GetSegmentAt(Address Addr) const {
+std::optional<Segment> AnalysisDatabase::GetSegmentAt(Address Addr) const {
     QReadLocker Locker(&Lock);
-    if (!SortedSegments.empty())
-        return FindSegmentCached(Addr);
-    for (const Segment& Seg : Binary.Segments) {
-        if (Addr >= Seg.VirtualAddress && Addr < Seg.VirtualAddress + Seg.VirtualSize)
-            return &Seg;
-    }
-    return nullptr;
+    const Segment* Seg = FindSegmentUnlocked(Addr);
+    if (!Seg) return std::nullopt;
+    return *Seg;
 }
 
 bool AnalysisDatabase::IsCodeAddress(Address Addr) const {
-    const Segment* Seg = GetSegmentAt(Addr);
+    QReadLocker Locker(&Lock);
+    const Segment* Seg = FindSegmentUnlocked(Addr);
     return Seg && Seg->IsExecutable;
 }
 
 bool AnalysisDatabase::IsDataAddress(Address Addr) const {
-    const Segment* Seg = GetSegmentAt(Addr);
+    QReadLocker Locker(&Lock);
+    const Segment* Seg = FindSegmentUnlocked(Addr);
     return Seg && !Seg->IsExecutable;
 }
 
 bool AnalysisDatabase::IsAddressValid(Address Addr) const {
-    return GetSegmentAt(Addr) != nullptr;
+    QReadLocker Locker(&Lock);
+    return FindSegmentUnlocked(Addr) != nullptr;
 }
 
 QByteArray AnalysisDatabase::ReadBytes(Address Addr, size_t Size) const {
-    const Segment* Seg = GetSegmentAt(Addr);
+    QReadLocker Locker(&Lock);
+    const Segment* Seg = FindSegmentUnlocked(Addr);
     if (!Seg) return QByteArray();
     size_t Offset = static_cast<size_t>(Addr - Seg->VirtualAddress);
     if (Offset >= static_cast<size_t>(Seg->Data.size()))

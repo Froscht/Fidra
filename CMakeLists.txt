@@ -66,3 +66,22 @@ add_subdirectory(src/scripting)
 if(Qt6WebEngineWidgets_FOUND)
     add_subdirectory(src/browser)
 endif()
+
+option(FIDRA_BUILD_TESTS "Build the analysis test driver" OFF)
+if(FIDRA_BUILD_TESTS)
+    add_executable(fidra_test_analysis test_analysis.cpp)
+    target_include_directories(fidra_test_analysis PRIVATE
+        ${FIDRA_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}
+    )
+    target_link_libraries(fidra_test_analysis PRIVATE
+        fidra_analysis
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Widgets
+        Qt6::Concurrent
+        capstone
+    )
+    enable_testing()
+    add_test(NAME analysis_smoke COMMAND fidra_test_analysis ${CMAKE_COMMAND})
+endif()

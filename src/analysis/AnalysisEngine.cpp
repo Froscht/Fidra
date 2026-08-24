@@ -14,6 +14,16 @@
 
 namespace Fidra {
 
+static QString InternMnemonic(const char* Str) {
+    thread_local QHash<QByteArray, QString> Cache;
+    QByteArray Key(Str);
+    auto It = Cache.constFind(Key);
+    if (It != Cache.constEnd()) return It.value();
+    QString Result = QString::fromUtf8(Str);
+    Cache.insert(Key, Result);
+    return Result;
+}
+
 AnalysisWorker::AnalysisWorker(AnalysisDatabase* Db, QObject* Parent)
     : QObject(Parent)
     , Db(Db)
@@ -84,6 +94,20 @@ void AnalysisWorker::Run() {
     FillCodeGaps();
     if (Cancelled.loadRelaxed()) { emit Finished(false); return; }
 
+    {
+        QMutexLocker Locker(&QueueMutex);
+        VisitedMT.clear();
+        VisitedMT.squeeze();
+        QueuedSetMT.clear();
+        QueuedSetMT.squeeze();
+        QueueMT.clear();
+    }
+    VisitedAddresses.clear();
+    VisitedAddresses.squeeze();
+    DisassemblyQueue.clear();
+    DisassemblyQueue.squeeze();
+    emit LogMessage(QString("Cleared disassembly work sets. Instructions: %1").arg(Db->InstructionCount()));
+
     Db->BuildInstructionIndex();
 
     EmitProgress(AnalysisState::FindingFunctions, 42, "Detecting tail call functions...");
@@ -93,6 +117,9 @@ void AnalysisWorker::Run() {
     EmitProgress(AnalysisState::FindingFunctions, 44, "Finding functions...");
     FindFunctions();
     if (Cancelled.loadRelaxed()) { emit Finished(false); return; }
+
+    FunctionStarts.clear();
+    FunctionStarts.squeeze();
 
     EmitProgress(AnalysisState::FindingStrings, 50, "Finding strings...");
     FindStrings();
@@ -1113,11 +1140,13 @@ void AnalysisWorker::DisassembleFromMT(Address Start, size_t CsHandle) {
             }
             if (Db->HasInstruction(InsnAddr)) { StopFlow = true; break; }
 
+            if (Db->InstructionLimitReached()) { StopFlow = true; break; }
+
             AnalyzedInstruction Ai;
             Ai.Addr = InsnAddr;
             std::memcpy(Ai.Bytes, Insns[I].bytes, std::min(static_cast<size_t>(Insns[I].size), static_cast<size_t>(15)));
             Ai.Size = static_cast<uint8_t>(Insns[I].size);
-            Ai.Mnemonic = QString::fromUtf8(Insns[I].mnemonic);
+            Ai.Mnemonic = InternMnemonic(Insns[I].mnemonic);
             Ai.Operands = QString::fromUtf8(Insns[I].op_str);
             Ai.Comment = QString();
             Ai.BranchTarget = 0;
@@ -1382,7 +1411,7 @@ void AnalysisWorker::RunRecursiveDescentMT() {
             if (cs_open(CsArch, CsMode, &Handle) != CS_ERR_OK) return;
             cs_option(Handle, CS_OPT_DETAIL, CS_OPT_ON);
 
-            while (!Cancelled.loadRelaxed()) {
+            while (!Cancelled.loadRelaxed() && !Db->InstructionLimitReached()) {
                 Address Target = 0;
                 {
                     QMutexLocker Locker(&QueueMutex);
@@ -1603,11 +1632,13 @@ void AnalysisWorker::DisassembleFrom(Address Start) {
 
             VisitedAddresses.insert(InsnAddr);
 
+            if (Db->InstructionLimitReached()) { StopFlow = true; break; }
+
             AnalyzedInstruction Ai;
             Ai.Addr = InsnAddr;
             std::memcpy(Ai.Bytes, Insns[I].bytes, std::min(static_cast<size_t>(Insns[I].size), static_cast<size_t>(15)));
             Ai.Size = static_cast<uint8_t>(Insns[I].size);
-            Ai.Mnemonic = QString::fromUtf8(Insns[I].mnemonic);
+            Ai.Mnemonic = InternMnemonic(Insns[I].mnemonic);
             Ai.Operands = QString::fromUtf8(Insns[I].op_str);
             Ai.Comment = QString();
             Ai.BranchTarget = 0;
@@ -1973,81 +2004,78 @@ bool AnalysisWorker::IsWideString(const uint8_t* Data, size_t MaxLen, int& OutLe
 }
 
 void AnalysisWorker::BuildXrefs() {
-    QMap<Address, QString> AllNames = Db->GetAllNames();
-    BinaryInfo Info = Db->GetBinaryInfo();
     int XrefCount = 0;
 
-    for (const Segment& Seg : Info.Segments) {
-        if (Cancelled.loadRelaxed()) return;
-        if (Seg.Type != SegmentType::Code) continue;
-
-        QList<AnalyzedInstruction> Insns = Db->GetInstructions(
-            Seg.VirtualAddress, Seg.VirtualAddress + Seg.VirtualSize);
-
-        for (const auto& Insn : Insns) {
-            if (Insn.IsCall && Insn.BranchTarget != 0) {
-                Xref Ref;
-                Ref.From = Insn.Addr;
-                Ref.To = Insn.BranchTarget;
-                Ref.Type = XrefType::CodeCall;
-                Db->AddXref(Ref);
-                XrefCount++;
-            } else if (Insn.IsJump && !Insn.IsConditional && Insn.BranchTarget != 0) {
-                Xref Ref;
-                Ref.From = Insn.Addr;
-                Ref.To = Insn.BranchTarget;
-                Ref.Type = XrefType::CodeJump;
-                Db->AddXref(Ref);
-                XrefCount++;
-            } else if (Insn.IsConditional && Insn.BranchTarget != 0) {
-                Xref Ref;
-                Ref.From = Insn.Addr;
-                Ref.To = Insn.BranchTarget;
-                Ref.Type = XrefType::CodeCondJump;
-                Db->AddXref(Ref);
-                XrefCount++;
-            }
-
-            if (Insn.MemoryRef != 0 && Db->IsAddressValid(Insn.MemoryRef)) {
-                Xref Ref;
-                Ref.From = Insn.Addr;
-                Ref.To = Insn.MemoryRef;
-                Ref.Type = Insn.Mnemonic.contains("lea") ? XrefType::DataOffset : XrefType::DataRead;
-                Db->AddXref(Ref);
-                XrefCount++;
-            }
+    Db->ForEachInstruction([&](const AnalyzedInstruction& Insn) {
+        if (Insn.IsCall && Insn.BranchTarget != 0) {
+            Xref Ref;
+            Ref.From = Insn.Addr;
+            Ref.To = Insn.BranchTarget;
+            Ref.Type = XrefType::CodeCall;
+            Db->AddXref(Ref);
+            XrefCount++;
+        } else if (Insn.IsJump && !Insn.IsConditional && Insn.BranchTarget != 0) {
+            Xref Ref;
+            Ref.From = Insn.Addr;
+            Ref.To = Insn.BranchTarget;
+            Ref.Type = XrefType::CodeJump;
+            Db->AddXref(Ref);
+            XrefCount++;
+        } else if (Insn.IsConditional && Insn.BranchTarget != 0) {
+            Xref Ref;
+            Ref.From = Insn.Addr;
+            Ref.To = Insn.BranchTarget;
+            Ref.Type = XrefType::CodeCondJump;
+            Db->AddXref(Ref);
+            XrefCount++;
         }
-    }
+
+        if (Insn.MemoryRef != 0 && Db->IsAddressValid(Insn.MemoryRef)) {
+            Xref Ref;
+            Ref.From = Insn.Addr;
+            Ref.To = Insn.MemoryRef;
+            Ref.Type = Insn.Mnemonic.contains("lea") ? XrefType::DataOffset : XrefType::DataRead;
+            Db->AddXref(Ref);
+            XrefCount++;
+        }
+    });
 
     emit LogMessage(QString("Built %1 cross-references").arg(XrefCount));
 }
 
 void AnalysisWorker::FindStringReferences() {
     QList<AnalyzedString> AllStrings = Db->GetAllStrings();
-    QMap<Address, int> StringAddrMap;
+    QHash<Address, int> StringAddrMap;
+    StringAddrMap.reserve(AllStrings.size());
     for (int I = 0; I < AllStrings.size(); ++I) {
         StringAddrMap[AllStrings[I].Addr] = I;
     }
 
-    BinaryInfo Info = Db->GetBinaryInfo();
+    struct PendingComment {
+        Address Addr;
+        QString Comment;
+        int StringIdx;
+    };
+    QList<PendingComment> Pending;
 
-    for (const Segment& Seg : Info.Segments) {
-        if (Cancelled.loadRelaxed()) return;
-        if (Seg.Type != SegmentType::Code) continue;
-
-        QList<AnalyzedInstruction> Insns = Db->GetInstructions(
-            Seg.VirtualAddress, Seg.VirtualAddress + Seg.VirtualSize);
-
-        for (const auto& Insn : Insns) {
-            if (Insn.MemoryRef != 0 && StringAddrMap.contains(Insn.MemoryRef)) {
-                int Idx = StringAddrMap[Insn.MemoryRef];
-                AllStrings[Idx].References.append(Insn.Addr);
-
-                AnalyzedInstruction Modified = Insn;
-                Modified.Comment = QString("\"%1\"").arg(AllStrings[Idx].Value.left(60));
-                Db->AddInstruction(Modified);
+    Db->ForEachInstruction([&](const AnalyzedInstruction& Insn) {
+        if (Insn.MemoryRef != 0) {
+            auto It = StringAddrMap.constFind(Insn.MemoryRef);
+            if (It != StringAddrMap.constEnd()) {
+                PendingComment Pc;
+                Pc.Addr = Insn.Addr;
+                Pc.Comment = QString("\"%1\"").arg(AllStrings[It.value()].Value.left(60));
+                Pc.StringIdx = It.value();
+                Pending.append(Pc);
             }
         }
+    });
+
+    for (const auto& Pc : Pending) {
+        AllStrings[Pc.StringIdx].References.append(Pc.Addr);
+        AnalyzedInstruction Insn = Db->GetInstruction(Pc.Addr);
+        Insn.Comment = Pc.Comment;
+        Db->AddInstruction(Insn);
     }
 
     for (const auto& Str : AllStrings) {
@@ -2208,11 +2236,11 @@ void AnalysisWorker::BuildBasicBlocks(AnalyzedFunction& Func, const QList<Analyz
         int InsnCount = 0;
         AnalyzedInstruction LastInsn;
         bool FoundLast = false;
-        for (const auto& Insn : Insns) {
-            if (Insn.Addr < Block.Start) continue;
-            if (Insn.Addr >= BlockEnd) break;
+        auto StartIt = AddrToInsn.lowerBound(Block.Start);
+        auto EndIt = AddrToInsn.lowerBound(BlockEnd);
+        for (auto It = StartIt; It != EndIt; ++It) {
             InsnCount++;
-            LastInsn = Insn;
+            LastInsn = Insns[It.value()];
             FoundLast = true;
         }
 
@@ -2320,9 +2348,10 @@ void AnalysisWorker::ComputeDominance(AnalyzedFunction& Func) {
             }
             if (!Pushed) {
                 DfsStack.removeLast();
-                ReversePostOrder.prepend(Cur);
+                ReversePostOrder.append(Cur);
             }
         }
+        std::reverse(ReversePostOrder.begin(), ReversePostOrder.end());
     }
 
     QList<int> Idom(N, -1);
@@ -2334,9 +2363,11 @@ void AnalysisWorker::ComputeDominance(AnalyzedFunction& Func) {
 
     auto Intersect = [&](int B1, int B2) -> int {
         int F1 = B1, F2 = B2;
-        while (F1 != F2) {
-            while (RpoIndex[F1] > RpoIndex[F2]) F1 = Idom[F1];
-            while (RpoIndex[F2] > RpoIndex[F1]) F2 = Idom[F2];
+        int Limit = N * 2;
+        while (F1 != F2 && Limit-- > 0) {
+            while (F1 >= 0 && F1 < N && RpoIndex[F1] > RpoIndex[F2]) F1 = Idom[F1];
+            while (F2 >= 0 && F2 < N && RpoIndex[F2] > RpoIndex[F1]) F2 = Idom[F2];
+            if (F1 < 0 || F1 >= N || F2 < 0 || F2 >= N) return 0;
         }
         return F1;
     };
@@ -2847,7 +2878,7 @@ void AnalysisWorker::RunLinearSweep() {
 
             int IdleCount = 0;
 
-            while (!Cancelled.loadRelaxed()) {
+            while (!Cancelled.loadRelaxed() && !Db->InstructionLimitReached()) {
                 Address Target = 0;
                 {
                     QMutexLocker Locker(&QueueMutex);
@@ -3037,45 +3068,42 @@ void AnalysisWorker::ScanCodePointers() {
         return false;
     };
 
-    for (const Segment& Seg : Info.Segments) {
-        if (Cancelled.loadRelaxed()) return;
-        if (Seg.Type != SegmentType::Code) continue;
+    QList<Address> Targets;
 
-        QList<AnalyzedInstruction> Insns = Db->GetInstructions(
-            Seg.VirtualAddress, Seg.VirtualAddress + Seg.VirtualSize);
+    Db->ForEachInstruction([&](const AnalyzedInstruction& Insn) {
+        if (Insn.MemoryRef == 0) return;
+        if (Insn.IsCall || Insn.IsJump) return;
 
-        for (const auto& Insn : Insns) {
-            if (Cancelled.loadRelaxed()) return;
-            if (Insn.MemoryRef == 0) continue;
-            if (Insn.IsCall || Insn.IsJump) continue;
+        Address DataAddr = Insn.MemoryRef;
+        if (!Db->IsAddressValid(DataAddr)) return;
 
-            Address DataAddr = Insn.MemoryRef;
-            if (!Db->IsAddressValid(DataAddr)) continue;
+        QByteArray PtrBytes = Db->ReadBytes(DataAddr, PtrSize);
+        if (PtrBytes.size() < PtrSize) return;
 
-            QByteArray PtrBytes = Db->ReadBytes(DataAddr, PtrSize);
-            if (PtrBytes.size() < PtrSize) continue;
+        uint64_t PtrVal = 0;
+        if (PtrSize == 8) {
+            std::memcpy(&PtrVal, PtrBytes.constData(), 8);
+        } else {
+            uint32_t Val32 = 0;
+            std::memcpy(&Val32, PtrBytes.constData(), 4);
+            PtrVal = Val32;
+        }
 
-            uint64_t PtrVal = 0;
-            if (PtrSize == 8) {
-                std::memcpy(&PtrVal, PtrBytes.constData(), 8);
-            } else {
-                uint32_t Val32 = 0;
-                std::memcpy(&Val32, PtrBytes.constData(), 4);
-                PtrVal = Val32;
-            }
+        if (PtrVal != 0 && IsCodeAddress(PtrVal) && !Db->HasInstruction(PtrVal)) {
+            Targets.append(static_cast<Address>(PtrVal));
+        }
+    });
 
-            if (PtrVal != 0 && IsCodeAddress(PtrVal) && !Db->HasInstruction(PtrVal)) {
-                QByteArray FirstBytes = Db->ReadBytes(PtrVal, 4);
-                if (FirstBytes.size() >= 1) {
-                    uint8_t FirstByte = static_cast<uint8_t>(FirstBytes[0]);
-                    if (FirstByte != 0x00 && FirstByte != 0xCC) {
-                        QMutexLocker Locker(&QueueMutex);
-                        if (!VisitedMT.contains(PtrVal) && !QueuedSetMT.contains(PtrVal)) {
-                            FunctionStarts.insert(PtrVal);
-                            AddDisassemblyTargetMT(PtrVal);
-                            CodePtrsFound++;
-                        }
-                    }
+    for (Address PtrVal : Targets) {
+        QByteArray FirstBytes = Db->ReadBytes(PtrVal, 4);
+        if (FirstBytes.size() >= 1) {
+            uint8_t FirstByte = static_cast<uint8_t>(FirstBytes[0]);
+            if (FirstByte != 0x00 && FirstByte != 0xCC) {
+                QMutexLocker Locker(&QueueMutex);
+                if (!VisitedMT.contains(PtrVal) && !QueuedSetMT.contains(PtrVal)) {
+                    FunctionStarts.insert(PtrVal);
+                    AddDisassemblyTargetMT(PtrVal);
+                    CodePtrsFound++;
                 }
             }
         }
@@ -3137,9 +3165,12 @@ void AnalysisWorker::FillCodeGaps() {
     cs_mode CsMode = Info.Is64Bit ? CS_MODE_64 : CS_MODE_32;
     int GapFuncsFound = 0;
     int GapInsnsAdded = 0;
+    constexpr int MaxGapInsns = 5000000;
 
     for (const Segment& Seg : Info.Segments) {
         if (Cancelled.loadRelaxed()) return;
+        if (GapInsnsAdded >= MaxGapInsns) break;
+        if (Db->InstructionLimitReached()) break;
         if (Seg.Type != SegmentType::Code && !Seg.IsExecutable) continue;
         if (Seg.Data.isEmpty()) continue;
 
@@ -3153,6 +3184,7 @@ void AnalysisWorker::FillCodeGaps() {
         size_t Off = 0;
         while (Off < SSize) {
             if (Cancelled.loadRelaxed()) break;
+            if (GapInsnsAdded >= MaxGapInsns || Db->InstructionLimitReached()) break;
 
             Address Addr = Seg.VirtualAddress + Off;
 
@@ -3239,7 +3271,7 @@ void AnalysisWorker::FillCodeGaps() {
                 Ai.Addr = InsnAddr;
                 std::memcpy(Ai.Bytes, Insns[I].bytes, std::min(static_cast<size_t>(Insns[I].size), static_cast<size_t>(15)));
                 Ai.Size = static_cast<uint8_t>(Insns[I].size);
-                Ai.Mnemonic = QString::fromUtf8(Insns[I].mnemonic);
+                Ai.Mnemonic = InternMnemonic(Insns[I].mnemonic);
                 Ai.Operands = QString::fromUtf8(Insns[I].op_str);
                 Ai.Comment = QString();
                 Ai.BranchTarget = 0;
@@ -3311,7 +3343,12 @@ void AnalysisWorker::FillCodeGaps() {
         cs_close(&Handle);
     }
 
-    emit LogMessage(QString("Gap fill: %1 new functions, %2 new instructions").arg(GapFuncsFound).arg(GapInsnsAdded));
+    if (GapInsnsAdded >= MaxGapInsns || Db->InstructionLimitReached()) {
+        emit LogMessage(QString("Gap fill: capped at %1 instructions (limit reached). %2 functions found")
+            .arg(GapInsnsAdded).arg(GapFuncsFound));
+    } else {
+        emit LogMessage(QString("Gap fill: %1 new functions, %2 new instructions").arg(GapFuncsFound).arg(GapInsnsAdded));
+    }
 }
 
 void AnalysisWorker::DetectTailCallFunctions() {
@@ -3381,120 +3418,118 @@ void AnalysisWorker::ResolveJumpTables() {
         }
     };
 
-    for (const Segment& Seg : Info.Segments) {
+    struct JumpCandidate {
+        Address Addr;
+        Address MemRef;
+        bool IsIndirect;
+    };
+    QList<JumpCandidate> Candidates;
+
+    Db->ForEachInstruction([&](const AnalyzedInstruction& Insn) {
+        if (!Insn.IsJump || Insn.IsConditional) return;
+        if (Insn.BranchTarget != 0) return;
+        Candidates.append({Insn.Addr, Insn.MemoryRef, Insn.IsIndirectJump});
+    });
+
+    for (const auto& Cand : Candidates) {
         if (Cancelled.loadRelaxed()) return;
-        if (Seg.Type != SegmentType::Code && !Seg.IsExecutable) continue;
 
-        QList<AnalyzedInstruction> Insns = Db->GetInstructions(
-            Seg.VirtualAddress, Seg.VirtualAddress + Seg.VirtualSize);
+        if (Cand.MemRef != 0 && Db->IsAddressValid(Cand.MemRef) && !Cand.IsIndirect) {
+            Address TableBase = Cand.MemRef;
+            for (int EntryIdx = 0; EntryIdx < 4096; ++EntryIdx) {
+                Address EntryAddr = TableBase + EntryIdx * PtrSize;
+                QByteArray PtrBytes = Db->ReadBytes(EntryAddr, PtrSize);
+                if (PtrBytes.size() < PtrSize) break;
 
-        for (int InsnIdx = 0; InsnIdx < Insns.size(); ++InsnIdx) {
-            if (Cancelled.loadRelaxed()) return;
-            const auto& Insn = Insns[InsnIdx];
-            if (!Insn.IsJump || Insn.IsConditional) continue;
-            if (Insn.BranchTarget != 0) continue;
+                uint64_t Target = 0;
+                if (PtrSize == 8) {
+                    std::memcpy(&Target, PtrBytes.constData(), 8);
+                } else {
+                    uint32_t Val32 = 0;
+                    std::memcpy(&Val32, PtrBytes.constData(), 4);
+                    Target = Val32;
+                }
 
-            if (Insn.MemoryRef != 0 && Db->IsAddressValid(Insn.MemoryRef)) {
-                Address TableBase = Insn.MemoryRef;
+                if (Target == 0) break;
+                if (!IsCodeAddr(Target)) break;
+                AddTarget(static_cast<Address>(Target));
+            }
+            continue;
+        }
 
-                for (int EntryIdx = 0; EntryIdx < 4096; ++EntryIdx) {
-                    Address EntryAddr = TableBase + EntryIdx * PtrSize;
-                    QByteArray PtrBytes = Db->ReadBytes(EntryAddr, PtrSize);
-                    if (PtrBytes.size() < PtrSize) break;
+        if (!Cand.IsIndirect) continue;
 
-                    uint64_t Target = 0;
-                    if (PtrSize == 8) {
-                        std::memcpy(&Target, PtrBytes.constData(), 8);
-                    } else {
-                        uint32_t Val32 = 0;
-                        std::memcpy(&Val32, PtrBytes.constData(), 4);
-                        Target = Val32;
+        Address WindowStart = (Cand.Addr > 128) ? Cand.Addr - 128 : 0;
+        QList<AnalyzedInstruction> Window = Db->GetInstructions(WindowStart, Cand.Addr);
+
+        int GuardTableSize = 0;
+        Address LeaBase = 0;
+        Address RelTableAddr = 0;
+
+        for (int Back = Window.size() - 1; Back >= 0 && Back >= Window.size() - 12; --Back) {
+            const auto& PrevInsn = Window[Back];
+            QString PrevMn = PrevInsn.Mnemonic.toLower();
+            QString PrevOp = PrevInsn.Operands.toLower();
+
+            if (GuardTableSize == 0 && (PrevMn == "cmp" || PrevMn == "test")) {
+                QRegularExpression CmpRe("(?:0x)?([0-9a-fA-F]+)");
+                auto CmpMatch = CmpRe.match(PrevOp);
+                if (CmpMatch.hasMatch()) {
+                    int Val = CmpMatch.captured(1).toInt(nullptr, 16);
+                    if (Val > 0 && Val <= 4096) {
+                        GuardTableSize = Val + 1;
                     }
+                }
+            }
 
-                    if (Target == 0) break;
+            if (PrevMn == "lea" && PrevInsn.MemoryRef != 0) {
+                if (PrevOp.contains("[rip")) {
+                    LeaBase = PrevInsn.MemoryRef;
+                }
+            }
+
+            if (PrevMn == "movsxd" || (PrevMn == "mov" && PrevOp.contains("dword"))) {
+                if (PrevInsn.MemoryRef != 0) {
+                    RelTableAddr = PrevInsn.MemoryRef;
+                }
+            }
+        }
+
+        if (RelTableAddr != 0 && LeaBase != 0 && Db->IsAddressValid(RelTableAddr)) {
+            int MaxEntries = GuardTableSize > 0 ? GuardTableSize : 1024;
+
+            for (int EntryIdx = 0; EntryIdx < MaxEntries; ++EntryIdx) {
+                Address EntryAddr = RelTableAddr + EntryIdx * 4;
+                QByteArray OffBytes = Db->ReadBytes(EntryAddr, 4);
+                if (OffBytes.size() < 4) break;
+
+                int32_t RelOffset = 0;
+                std::memcpy(&RelOffset, OffBytes.constData(), 4);
+
+                uint64_t Target = LeaBase + RelOffset;
+                if (!IsCodeAddr(Target)) {
+                    if (EntryIdx == 0) break;
+                    continue;
+                }
+                AddTarget(static_cast<Address>(Target));
+            }
+        } else if (RelTableAddr != 0 && LeaBase == 0 && Db->IsAddressValid(RelTableAddr)) {
+            AnalyzedFunction ContFunc = Db->GetFunctionContaining(Cand.Addr);
+            int MaxEntries = GuardTableSize > 0 ? GuardTableSize : 1024;
+            for (int EntryIdx = 0; EntryIdx < MaxEntries; ++EntryIdx) {
+                Address EntryAddr = RelTableAddr + EntryIdx * 4;
+                QByteArray OffBytes = Db->ReadBytes(EntryAddr, 4);
+                if (OffBytes.size() < 4) break;
+
+                int32_t RelOffset = 0;
+                std::memcpy(&RelOffset, OffBytes.constData(), 4);
+
+                uint64_t Target = RelTableAddr + RelOffset;
+                if (!IsCodeAddr(Target)) {
+                    Target = Cand.Addr + RelOffset;
                     if (!IsCodeAddr(Target)) break;
-                    AddTarget(static_cast<Address>(Target));
                 }
-                continue;
-            }
-
-            if (!Insn.IsIndirectJump) continue;
-
-            int GuardTableSize = 0;
-            Address LeaBase = 0;
-            Address RelTableAddr = 0;
-
-            for (int Back = InsnIdx - 1; Back >= 0 && Back >= InsnIdx - 12; --Back) {
-                const auto& PrevInsn = Insns[Back];
-                QString PrevMn = PrevInsn.Mnemonic.toLower();
-                QString PrevOp = PrevInsn.Operands.toLower();
-
-                if (GuardTableSize == 0 && (PrevMn == "cmp" || PrevMn == "test")) {
-                    QRegularExpression CmpRe("(?:0x)?([0-9a-fA-F]+)");
-                    auto CmpMatch = CmpRe.match(PrevOp);
-                    if (CmpMatch.hasMatch()) {
-                        int Val = CmpMatch.captured(1).toInt(nullptr, 16);
-                        if (Val > 0 && Val <= 4096) {
-                            GuardTableSize = Val + 1;
-                        }
-                    }
-                }
-
-                if (PrevMn == "lea" && PrevInsn.MemoryRef != 0) {
-                    if (PrevOp.contains("[rip")) {
-                        LeaBase = PrevInsn.MemoryRef;
-                    }
-                }
-
-                if (PrevMn == "movsxd" || (PrevMn == "mov" && PrevOp.contains("dword"))) {
-                    if (PrevInsn.MemoryRef != 0) {
-                        RelTableAddr = PrevInsn.MemoryRef;
-                    }
-                }
-            }
-
-            if (RelTableAddr != 0 && LeaBase != 0 && Db->IsAddressValid(RelTableAddr)) {
-                int MaxEntries = GuardTableSize > 0 ? GuardTableSize : 1024;
-
-                for (int EntryIdx = 0; EntryIdx < MaxEntries; ++EntryIdx) {
-                    Address EntryAddr = RelTableAddr + EntryIdx * 4;
-                    QByteArray OffBytes = Db->ReadBytes(EntryAddr, 4);
-                    if (OffBytes.size() < 4) break;
-
-                    int32_t RelOffset = 0;
-                    std::memcpy(&RelOffset, OffBytes.constData(), 4);
-
-                    uint64_t Target = LeaBase + RelOffset;
-
-                    if (!IsCodeAddr(Target)) {
-                        if (EntryIdx == 0) break;
-                        continue;
-                    }
-
-                    AddTarget(static_cast<Address>(Target));
-                }
-            } else if (RelTableAddr != 0 && LeaBase == 0 && Db->IsAddressValid(RelTableAddr)) {
-                Address FuncContaining = 0;
-                AnalyzedFunction ContFunc = Db->GetFunctionContaining(Insn.Addr);
-                if (ContFunc.Start != 0) FuncContaining = ContFunc.Start;
-
-                int MaxEntries = GuardTableSize > 0 ? GuardTableSize : 1024;
-                for (int EntryIdx = 0; EntryIdx < MaxEntries; ++EntryIdx) {
-                    Address EntryAddr = RelTableAddr + EntryIdx * 4;
-                    QByteArray OffBytes = Db->ReadBytes(EntryAddr, 4);
-                    if (OffBytes.size() < 4) break;
-
-                    int32_t RelOffset = 0;
-                    std::memcpy(&RelOffset, OffBytes.constData(), 4);
-
-                    uint64_t Target = RelTableAddr + RelOffset;
-                    if (!IsCodeAddr(Target)) {
-                        Target = Insn.Addr + RelOffset;
-                        if (!IsCodeAddr(Target)) break;
-                    }
-
-                    AddTarget(static_cast<Address>(Target));
-                }
+                AddTarget(static_cast<Address>(Target));
             }
         }
     }
@@ -5038,30 +5073,23 @@ void AnalysisWorker::GenerateAutoComments() {
 
     int CommentsAdded = 0;
 
-    for (const Segment& Seg : Info.Segments) {
-        if (Cancelled.loadRelaxed()) return;
-        if (Seg.Type != SegmentType::Code) continue;
+    struct PendingComment {
+        Address Addr;
+        QString Comment;
+    };
+    QList<PendingComment> Pending;
 
-        QList<AnalyzedInstruction> Insns = Db->GetInstructions(
-            Seg.VirtualAddress, Seg.VirtualAddress + Seg.VirtualSize);
+    Db->ForEachInstruction([&](const AnalyzedInstruction& Insn) {
+        if (!Insn.Comment.isEmpty()) return;
 
-        for (const auto& Insn : Insns) {
-            if (Cancelled.loadRelaxed()) return;
-            if (!Insn.IsCall) continue;
-            if (!Insn.Comment.isEmpty()) continue;
-
+        if (Insn.IsCall) {
             Address Target = Insn.BranchTarget;
-            if (Target == 0 && Insn.MemoryRef != 0) {
-                Target = Insn.MemoryRef;
-            }
-            if (Target == 0) continue;
+            if (Target == 0 && Insn.MemoryRef != 0) Target = Insn.MemoryRef;
+            if (Target == 0) return;
 
             QString TargetName;
-            if (FuncNamesByAddr.contains(Target)) {
-                TargetName = FuncNamesByAddr[Target];
-            }
-
-            if (TargetName.isEmpty()) continue;
+            if (FuncNamesByAddr.contains(Target)) TargetName = FuncNamesByAddr[Target];
+            if (TargetName.isEmpty()) return;
 
             QString BaseName = TargetName;
             int DotIdx = BaseName.lastIndexOf('.');
@@ -5070,59 +5098,36 @@ void AnalysisWorker::GenerateAutoComments() {
             if (ColonIdx >= 0) BaseName = BaseName.mid(ColonIdx + 2);
 
             if (KnownApis.contains(BaseName)) {
-                AnalyzedInstruction Modified = Insn;
-                Modified.Comment = KnownApis[BaseName].Signature;
-                Db->AddInstruction(Modified);
-                CommentsAdded++;
+                Pending.append({Insn.Addr, KnownApis[BaseName].Signature});
+            }
+            return;
+        }
+
+        if (Insn.Mnemonic == "syscall" || Insn.Mnemonic == "int" || Insn.Mnemonic == "sysenter") {
+            Pending.append({Insn.Addr, QStringLiteral("syscall (check RAX for syscall number)")});
+            return;
+        }
+
+        if (Insn.IsJump || Insn.IsRet) return;
+
+        QString Ops = Insn.Operands;
+        for (const auto& Const : KnownConstants) {
+            if (Const.Value <= 4) continue;
+            QString HexStr = QString("0x%1").arg(Const.Value, 0, 16);
+            if (Ops.contains(HexStr, Qt::CaseInsensitive) ||
+                Ops.contains(QString::number(Const.Value))) {
+                Pending.append({Insn.Addr, Const.Name});
+                break;
             }
         }
-    }
+    });
 
-    for (const Segment& Seg : Info.Segments) {
-        if (Cancelled.loadRelaxed()) return;
-        if (Seg.Type != SegmentType::Code) continue;
-
-        QList<AnalyzedInstruction> Insns = Db->GetInstructions(
-            Seg.VirtualAddress, Seg.VirtualAddress + Seg.VirtualSize);
-
-        for (const auto& Insn : Insns) {
-            if (Cancelled.loadRelaxed()) return;
-
-            if (Insn.Mnemonic == "syscall" || Insn.Mnemonic == "int" || Insn.Mnemonic == "sysenter") {
-                if (!Insn.Comment.isEmpty()) continue;
-
-                AnalyzedInstruction Modified = Insn;
-                Modified.Comment = "syscall (check RAX for syscall number)";
-                Db->AddInstruction(Modified);
-                CommentsAdded++;
-                continue;
-            }
-
-            if (!Insn.Comment.isEmpty()) continue;
-            if (Insn.IsCall || Insn.IsJump || Insn.IsRet) continue;
-
-            QString Ops = Insn.Operands;
-            bool FoundConst = false;
-
-            for (const auto& Const : KnownConstants) {
-                if (FoundConst) break;
-
-                QString HexStr = QString("0x%1").arg(Const.Value, 0, 16);
-                QString HexStrLower = HexStr.toLower();
-
-                if (Ops.contains(HexStr, Qt::CaseInsensitive) ||
-                    Ops.contains(QString::number(Const.Value))) {
-
-                    if (Const.Value <= 4) continue;
-
-                    AnalyzedInstruction Modified = Insn;
-                    Modified.Comment = Const.Name;
-                    Db->AddInstruction(Modified);
-                    CommentsAdded++;
-                    FoundConst = true;
-                }
-            }
-        }
+    for (const auto& Pc : Pending) {
+        AnalyzedInstruction Insn = Db->GetInstruction(Pc.Addr);
+        if (!Insn.Comment.isEmpty()) continue;
+        Insn.Comment = Pc.Comment;
+        Db->AddInstruction(Insn);
+        CommentsAdded++;
     }
 
     emit LogMessage(QString("Auto-comments: %1 comments added").arg(CommentsAdded));

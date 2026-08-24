@@ -49,9 +49,9 @@ int main(int Argc, char* Argv[]) {
             printf("Image Size:   %zu bytes\n", Info.ImageSize);
             printf("DLL:          %s\n", Info.IsDll ? "yes" : "no");
             printf("Driver:       %s\n", Info.IsDriver ? "yes" : "no");
-            printf("Segments:     %d\n", Info.Segments.size());
-            printf("Imports:      %d\n", Info.Imports.size());
-            printf("Exports:      %d\n", Info.Exports.size());
+            printf("Segments:     %lld\n", static_cast<long long>(Info.Segments.size()));
+            printf("Imports:      %lld\n", static_cast<long long>(Info.Imports.size()));
+            printf("Exports:      %lld\n", static_cast<long long>(Info.Exports.size()));
             printf("\n--- Analysis Results ---\n");
             printf("Functions:    %d\n", Db->FunctionCount());
             printf("Instructions: %d\n", Db->InstructionCount());

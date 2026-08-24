@@ -12,6 +12,8 @@
 #include <QAtomicInt>
 #include <vector>
 #include <atomic>
+#include <functional>
+#include <optional>
 
 namespace Fidra {
 
@@ -19,6 +21,8 @@ class AnalysisDatabase : public QObject {
     Q_OBJECT
 
 public:
+    static constexpr int MaxInstructions = 20000000;
+
     explicit AnalysisDatabase(QObject* Parent = nullptr);
     ~AnalysisDatabase() override;
 
@@ -32,6 +36,8 @@ public:
     bool HasInstruction(Address Addr) const;
     QList<AnalyzedInstruction> GetInstructions(Address Start, Address End) const;
     int InstructionCount() const;
+    bool InstructionLimitReached() const;
+    void ForEachInstruction(const std::function<void(const AnalyzedInstruction&)>& Callback) const;
 
     void AddFunction(const AnalyzedFunction& Func);
     void UpdateFunction(Address Start, const AnalyzedFunction& Func);
@@ -39,6 +45,7 @@ public:
     AnalyzedFunction GetFunctionContaining(Address Addr) const;
     bool HasFunction(Address Addr) const;
     QList<AnalyzedFunction> GetAllFunctions() const;
+    void ForEachFunction(const std::function<void(const AnalyzedFunction&)>& Callback) const;
     int FunctionCount() const;
 
     void AddXref(const Xref& Ref);
@@ -50,6 +57,7 @@ public:
     AnalyzedString GetString(Address Addr) const;
     bool HasString(Address Addr) const;
     QList<AnalyzedString> GetAllStrings() const;
+    void ForEachString(const std::function<void(const AnalyzedString&)>& Callback) const;
     int StringCount() const;
 
     void SetItemType(Address Addr, ItemType Type);
@@ -64,7 +72,7 @@ public:
     QString GetComment(Address Addr) const;
     QMap<Address, QString> GetAllComments() const;
 
-    const Segment* GetSegmentAt(Address Addr) const;
+    std::optional<Segment> GetSegmentAt(Address Addr) const;
     bool IsCodeAddress(Address Addr) const;
     bool IsDataAddress(Address Addr) const;
     bool IsAddressValid(Address Addr) const;
@@ -82,10 +90,11 @@ signals:
     void AnalysisUpdated();
 
 private:
-    const Segment* FindSegmentCached(Address Addr) const;
+    const Segment* FindSegmentUnlocked(Address Addr) const;
 
-    mutable QReadWriteLock Lock;
-    mutable QReadWriteLock InsnLock;
+    mutable QReadWriteLock Lock{QReadWriteLock::Recursive};
+    mutable QReadWriteLock InsnLock{QReadWriteLock::Recursive};
+    bool LimitWarned = false;
     BinaryInfo Binary;
     QHash<Address, AnalyzedInstruction> Instructions;
     QMap<Address, AnalyzedFunction> Functions;
