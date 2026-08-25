@@ -11,6 +11,18 @@
 #include <QMimeData>
 #include <QFileInfo>
 
+namespace {
+inline bool IsPluginFile(const QString& Path) {
+#ifdef Q_OS_WIN
+    return Path.endsWith(QStringLiteral(".dll"), Qt::CaseInsensitive);
+#elif defined(Q_OS_MAC)
+    return Path.endsWith(QStringLiteral(".dylib"), Qt::CaseInsensitive);
+#else
+    return Path.endsWith(QStringLiteral(".so"));
+#endif
+}
+}
+
 namespace Fidra {
 
 PluginWidget::PluginWidget(QWidget* Parent, ICore* Core)
@@ -160,7 +172,7 @@ void PluginWidget::dragEnterEvent(QDragEnterEvent* Event)
     }
 
     for (const QUrl& Url : Event->mimeData()->urls()) {
-        if (Url.isLocalFile() && Url.toLocalFile().endsWith(QStringLiteral(".so"))) {
+        if (Url.isLocalFile() && IsPluginFile(Url.toLocalFile())) {
             Event->acceptProposedAction();
             return;
         }
@@ -185,7 +197,7 @@ void PluginWidget::dropEvent(QDropEvent* Event)
     for (const QUrl& Url : Event->mimeData()->urls()) {
         if (!Url.isLocalFile()) continue;
         QString FilePath = Url.toLocalFile();
-        if (!FilePath.endsWith(QStringLiteral(".so"))) continue;
+        if (!IsPluginFile(FilePath)) continue;
 
         QString ConfigPath = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation);
         QString PluginDir = ConfigPath + QStringLiteral("/fidra/plugins");

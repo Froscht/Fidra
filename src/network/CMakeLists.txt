@@ -24,3 +24,7 @@ target_link_libraries(fidra_network PRIVATE
     Qt6::Widgets
     Qt6::Network
 )
+
+if(WIN32)
+    target_link_libraries(fidra_network PRIVATE ws2_32 mswsock iphlpapi)
+endif()

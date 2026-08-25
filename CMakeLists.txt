@@ -8,8 +8,8 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
 if(MSVC)
-    add_compile_options(/W4 /MP /Zc:__cplusplus)
-    add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_compile_options(/W4 /MP /Zc:__cplusplus /utf-8 /permissive-)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
 else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
@@ -17,15 +17,31 @@ endif()
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network Concurrent)
 find_package(Qt6 COMPONENTS WebEngineWidgets QUIET)
 
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(CAPSTONE REQUIRED IMPORTED_TARGET capstone)
-add_library(capstone ALIAS PkgConfig::CAPSTONE)
+# Capstone: prefer proper CMake config (vcpkg on Windows, distros that ship it),
+# fall back to pkg-config on POSIX where it is the norm.
+find_package(capstone CONFIG QUIET)
+if(TARGET capstone::capstone)
+    add_library(capstone ALIAS capstone::capstone)
+elseif(TARGET capstone)
+    # target already provided
+else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(CAPSTONE REQUIRED IMPORTED_TARGET capstone)
+    add_library(capstone ALIAS PkgConfig::CAPSTONE)
+endif()
 
-find_package(nlohmann_json 3 QUIET)
+# nlohmann_json: use the config package if present (vcpkg, most distros).
+# Otherwise, fetch a header-only copy so the build is self-contained on any OS.
+find_package(nlohmann_json 3 CONFIG QUIET)
 if(NOT nlohmann_json_FOUND)
-    add_library(nlohmann_json_header INTERFACE)
-    target_include_directories(nlohmann_json_header INTERFACE /usr/include)
-    add_library(nlohmann_json::nlohmann_json ALIAS nlohmann_json_header)
+    include(FetchContent)
+    FetchContent_Declare(nlohmann_json
+        GIT_REPOSITORY https://github.com/nlohmann/json.git
+        GIT_TAG v3.11.3
+        GIT_SHALLOW TRUE
+    )
+    set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(nlohmann_json)
 endif()
 
 include(FetchContent)

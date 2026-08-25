@@ -20,7 +20,11 @@ target_link_libraries(fidra_plugin PRIVATE
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
-    dl
 )
+
+# libdl only exists on Unix; on Windows dynamic loading is in the base API.
+if(NOT WIN32)
+    target_link_libraries(fidra_plugin PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 set_target_properties(fidra_plugin PROPERTIES AUTOMOC ON)

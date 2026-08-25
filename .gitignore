@@ -35,7 +35,9 @@ desktop.ini
 
 # Debug
 *.dSYM/
-/core
+# Linux crash dumps only — must stay anchored/numbered so they do NOT
+# swallow the src/core source directory.
+/core.[0-9]*
 core.[0-9]*
 vgcore.*
 
@@ -52,6 +54,7 @@ vgcore.*
 *.bak
 *.orig
 
-# Binary output
-Fidra
-fidra
+# Binary output — anchored to repo root so they only match the built
+# executable, NOT the include/fidra/ source directory or a Fidra/ dir.
+/Fidra
+/fidra

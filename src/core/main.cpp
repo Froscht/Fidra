@@ -12,7 +12,6 @@
 #include <QElapsedTimer>
 #include <cstring>
 #include <cstdio>
-#include <unistd.h>
 
 #include "../analysis/AnalysisEngine.h"
 #include "../analysis/AnalysisDatabase.h"
@@ -62,7 +61,7 @@ static void PrintUsage() {
 
 static void PrintVersion() {
     const char Msg[] = "Fidra v1.0.0\n";
-    write(STDOUT_FILENO, Msg, sizeof(Msg) - 1);
+    fputs(Msg, stdout);
 }
 
 static QString FindArgValue(int Argc, char* Argv[], const QString& Flag) {

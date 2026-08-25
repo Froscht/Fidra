@@ -9,7 +9,9 @@
 #include <QThread>
 #include <QCoreApplication>
 #include <QStorageInfo>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 namespace Fidra {
 
@@ -602,8 +604,12 @@ void McpToolRegistry::RegisterUtilityTools() {
             qint64 Cutime = Fields[13].toLongLong();
             qint64 Cstime = Fields[14].toLongLong();
             qint64 StartTime = Fields[19].toLongLong();
+#ifdef _WIN32
+            long ClkTck = 100;
+#else
             long ClkTck = sysconf(_SC_CLK_TCK);
             if (ClkTck <= 0) ClkTck = 100;
+#endif
             QJsonObject Result;
             Result[QStringLiteral("pid")] = Pid;
             Result[QStringLiteral("user_time_ticks")] = Utime;

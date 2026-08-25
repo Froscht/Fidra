@@ -1,4 +1,5 @@
 #include "PluginLoader.h"
+#include <QCoreApplication>
 #include <QDir>
 #include <QDirIterator>
 #include <QFileInfo>
@@ -10,7 +11,7 @@ PluginLoader::PluginLoader(ICore* Core, QObject* Parent)
     : QObject(Parent)
     , CoreRef(Core)
 {
-    SearchPaths.append(QStringLiteral("./plugins/"));
+    SearchPaths.append(QCoreApplication::applicationDirPath() + QStringLiteral("/plugins/"));
 
     QString HomePath = QDir::homePath();
     SearchPaths.append(HomePath + QStringLiteral("/.fidra/plugins/"));
@@ -32,7 +33,13 @@ QStringList PluginLoader::ScanDirectory(const QString& Path)
     }
 
     QStringList NameFilters;
+#ifdef Q_OS_WIN
+    NameFilters << QStringLiteral("*.dll");
+#elif defined(Q_OS_MAC)
+    NameFilters << QStringLiteral("*.dylib");
+#else
     NameFilters << QStringLiteral("*.so");
+#endif
 
     QDirIterator Iterator(Path, NameFilters, QDir::Files, QDirIterator::NoIteratorFlags);
     while (Iterator.hasNext()) {

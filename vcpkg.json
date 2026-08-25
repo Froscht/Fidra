@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "fidra",
+  "version-string": "1.0.0",
+  "description": "Fidra - Open-Source Reverse Engineering IDE",
+  "homepage": "https://github.com/user/fidra",
+  "dependencies": [
+    "capstone",
+    "nlohmann-json"
+  ],
+  "builtin-baseline": "b5d1a94fb7f88fd835e360fd23a45a09ceedbf48"
+}

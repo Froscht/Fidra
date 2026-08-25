@@ -18,6 +18,12 @@
 #include <sys/uio.h>
 #endif
 
+#ifdef _WIN32
+#include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
+typedef long long off_t;
+#endif
+
 namespace Fidra {
 
 ProcessDumper::ProcessDumper(QObject* Parent)

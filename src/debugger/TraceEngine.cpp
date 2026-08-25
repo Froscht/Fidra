@@ -3,14 +3,18 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <QFile>
 
+#include <capstone/capstone.h>
+#include <cstring>
+
+#ifndef _WIN32
 #include <sys/ptrace.h>
 #include <sys/wait.h>
 #include <sys/user.h>
-#include <capstone/capstone.h>
-#include <cstring>
 #include <unistd.h>
 #include <errno.h>
+#endif
 
 namespace Fidra {
 
@@ -37,6 +41,11 @@ signals:
 
 protected:
     void run() override {
+#ifdef _WIN32
+        emit Error("Instruction tracing is only implemented on Linux (ptrace). "
+                   "Windows single-step tracing via the Debug API is not wired up yet.");
+        return;
+#else
         csh CapstoneHandle;
         if (cs_open(CS_ARCH_X86, CS_MODE_64, &CapstoneHandle) != CS_ERR_OK) {
             emit Error("Failed to initialize capstone disassembler");
@@ -192,9 +201,11 @@ protected:
         ptrace(PTRACE_DETACH, TargetPid, nullptr, nullptr);
 
         emit Finished(EntryIndex);
+#endif
     }
 
 private:
+#ifndef _WIN32
     uint64_t GetRegValue(const struct user_regs_struct& Regs, x86_reg Reg) const {
         switch (Reg) {
         case X86_REG_RAX: case X86_REG_EAX: case X86_REG_AX: case X86_REG_AL: return Regs.rax;
@@ -243,6 +254,7 @@ private:
         }
         return {};
     }
+#endif
 
     TraceEngine* OwnerRef;
     int TargetPid;

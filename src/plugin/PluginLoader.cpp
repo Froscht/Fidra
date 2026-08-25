@@ -1,4 +1,5 @@
 #include "PluginLoader.h"
+#include <QCoreApplication>
 #include <QDir>
 #include <QDirIterator>
 #include <QFileInfo>
@@ -13,7 +14,11 @@ PluginLoader::PluginLoader(QObject* Parent)
 {
     QString ConfigPath = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation);
     PluginDirectories.append(ConfigPath + QStringLiteral("/fidra/plugins"));
+#ifdef Q_OS_WIN
+    PluginDirectories.append(QCoreApplication::applicationDirPath() + QStringLiteral("/plugins"));
+#else
     PluginDirectories.append(QStringLiteral("/usr/lib/fidra/plugins"));
+#endif
 }
 
 PluginLoader::~PluginLoader()
@@ -32,7 +37,13 @@ QStringList PluginLoader::DiscoverPlugins() const
 {
     QStringList FoundPlugins;
     QStringList NameFilters;
+#ifdef Q_OS_WIN
+    NameFilters << QStringLiteral("*.dll");
+#elif defined(Q_OS_MAC)
+    NameFilters << QStringLiteral("*.dylib");
+#else
     NameFilters << QStringLiteral("*.so");
+#endif
 
     for (const QString& DirPath : PluginDirectories) {
         QDir Dir(DirPath);

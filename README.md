@@ -5,7 +5,7 @@
 <h1 align="center">Fidra</h1>
 
 <p align="center">
-  <strong>Open-Source Reverse Engineering IDE for Linux</strong>
+  <strong>Open-Source Reverse Engineering IDE for Linux &amp; Windows</strong>
 </p>
 
 <p align="center">
@@ -23,7 +23,7 @@
   <img src="https://img.shields.io/badge/License-GPLv3-blue.svg" alt="License: GPL v3"/>
   <img src="https://img.shields.io/badge/C%2B%2B-20-blue.svg" alt="C++20"/>
   <img src="https://img.shields.io/badge/Qt-6.4+-green.svg" alt="Qt 6.4+"/>
-  <img src="https://img.shields.io/badge/Platform-Linux-lightgrey.svg" alt="Platform: Linux"/>
+  <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20Windows-lightgrey.svg" alt="Platform: Linux | Windows"/>
   <img src="https://img.shields.io/badge/Lines_of_Code-75k+-orange.svg" alt="Lines of Code: 75k+"/>
 </p>
 
@@ -534,37 +534,77 @@ Every feature is an `IModule` — a self-contained unit with its own widgets, do
 
 ## Building
 
-### Dependencies
+Fidra builds from a single source tree on both **Linux** and **Windows**.
+The included `CMakePresets.json` selects the right toolchain and options per
+platform, so the same commands work everywhere.
+
+### Linux
 
 ```bash
 # Ubuntu/Debian
-sudo apt install build-essential cmake qt6-base-dev qt6-base-dev-tools \
-    libqt6opengl6-dev qt6-webengine-dev libcapstone-dev pkg-config
+sudo apt install build-essential cmake ninja-build qt6-base-dev qt6-base-dev-tools \
+    libqt6opengl6-dev qt6-webengine-dev libcapstone-dev nlohmann-json3-dev pkg-config
 
 # Fedora
-sudo dnf install cmake gcc-c++ qt6-qtbase-devel qt6-qtwebengine-devel \
-    capstone-devel pkg-config
+sudo dnf install cmake ninja-build gcc-c++ qt6-qtbase-devel qt6-qtwebengine-devel \
+    capstone-devel json-devel pkg-config
 
 # Arch
-sudo pacman -S cmake qt6-base qt6-webengine capstone pkgconf
+sudo pacman -S cmake ninja qt6-base qt6-webengine capstone nlohmann-json pkgconf
 ```
-
-LIEF is fetched automatically via CMake FetchContent.
-
-### Build
 
 ```bash
 git clone https://github.com/user/fidra.git
 cd fidra
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
+cmake --preset linux-release
+cmake --build --preset linux-release
 ```
+
+LIEF (and, if the system package is absent, nlohmann_json) is fetched
+automatically via CMake FetchContent.
+
+### Windows (MSVC + vcpkg)
+
+**Prerequisites**
+
+- Visual Studio 2022 (Desktop development with C++) — provides MSVC and CMake
+- [Qt 6.4+ for MSVC](https://www.qt.io/download-qt-installer) (e.g. `msvc2022_64`)
+- [vcpkg](https://github.com/microsoft/vcpkg) with the `VCPKG_ROOT` environment
+  variable set — supplies **capstone** and **nlohmann-json** (see `vcpkg.json`)
+
+```powershell
+git clone https://github.com/user/fidra.git
+cd fidra
+
+# Point CMake at your Qt install (adjust the path/version).
+$env:CMAKE_PREFIX_PATH = "C:\Qt\6.7.2\msvc2022_64"
+
+# Visual Studio generator:
+cmake --preset windows-msvc
+cmake --build --preset windows-msvc
+
+# ...or the Ninja generator from a "x64 Native Tools" prompt:
+cmake --preset windows-msvc-ninja
+cmake --build --preset windows-msvc-ninja
+```
+
+vcpkg is wired in through the preset's toolchain file, so `capstone` and
+`nlohmann-json` are restored automatically from `vcpkg.json` on first configure.
+LIEF is still fetched via FetchContent.
+
+> **Platform notes.** The debugger uses the Windows Debug API on Windows and
+> `ptrace` on Linux. Instruction tracing (`TraceEngine`), the raw-socket packet
+> sniffer, and the process dumper are currently Linux-first — on Windows they
+> build but some paths are stubbed. Everything else (disassembler, decompiler,
+> hex editor, scanner, CFG, MCP tools, scripting, diffing) is fully
+> cross-platform.
 
 ### Build without WebEngine (lighter)
 
+Append the flag to either platform's configure step:
+
 ```bash
-cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_DISABLE_FIND_PACKAGE_Qt6WebEngineWidgets=TRUE
+cmake --preset linux-release -DCMAKE_DISABLE_FIND_PACKAGE_Qt6WebEngineWidgets=TRUE
 ```
 
 ### Run
@@ -574,6 +614,11 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_DISABLE_FIND_PACKAGE_Qt6WebEngineWid
 ./Fidra /path/to/binary          # Open binary directly
 ./Fidra --headless binary.exe    # Headless analysis (JSON output)
 ```
+
+On Windows the binary is `Fidra.exe` under `build/windows-msvc/` (add
+`\Debug` or `\RelWithDebInfo` for the Visual Studio generator). Make sure Qt's
+`bin` directory is on `PATH`, or run `windeployqt Fidra.exe` to gather the Qt
+DLLs next to the executable.
 
 ---
 

@@ -8,8 +8,24 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#if defined(__GNUC__) || defined(__clang__)
 #include <cxxabi.h>
+#endif
 #include <cstdlib>
+
+namespace {
+// Cross-platform Itanium C++ ABI demangler shim.
+// On MSVC we cannot demangle "_Z..." names natively, so callers see Status != 0.
+inline char* FidraCxaDemangle(const char* Mangled, char* OutputBuffer, size_t* Length, int* Status) {
+#if defined(__GNUC__) || defined(__clang__)
+    return abi::__cxa_demangle(Mangled, OutputBuffer, Length, Status);
+#else
+    (void)Mangled; (void)OutputBuffer; (void)Length;
+    if (Status) *Status = -1;
+    return nullptr;
+#endif
+}
+}
 #include <QRegularExpression>
 
 namespace Fidra {
@@ -3706,7 +3722,7 @@ void AnalysisWorker::DemangleNames() {
 
         if (Func.Name.startsWith("_Z")) {
             int Status = 0;
-            char* Demangled = abi::__cxa_demangle(MangledStr, nullptr, nullptr, &Status);
+            char* Demangled = FidraCxaDemangle(MangledStr, nullptr, nullptr, &Status);
             if (Status == 0 && Demangled) {
                 Func.DemangledName = QString::fromUtf8(Demangled);
                 Db->UpdateFunction(Func.Start, Func);
@@ -3723,7 +3739,7 @@ void AnalysisWorker::DemangleNames() {
         if (Imp.FuncName.startsWith("_Z")) {
             QByteArray Bytes = Imp.FuncName.toLatin1();
             int Status = 0;
-            char* Demangled = abi::__cxa_demangle(Bytes.constData(), nullptr, nullptr, &Status);
+            char* Demangled = FidraCxaDemangle(Bytes.constData(), nullptr, nullptr, &Status);
             if (Status == 0 && Demangled) {
                 QString DemangledStr = QString::fromUtf8(Demangled);
                 Db->SetName(Imp.IatAddress, DemangledStr);
@@ -3743,7 +3759,7 @@ void AnalysisWorker::DemangleNames() {
         if (Exp.Name.startsWith("_Z")) {
             QByteArray Bytes = Exp.Name.toLatin1();
             int Status = 0;
-            char* Demangled = abi::__cxa_demangle(Bytes.constData(), nullptr, nullptr, &Status);
+            char* Demangled = FidraCxaDemangle(Bytes.constData(), nullptr, nullptr, &Status);
             if (Status == 0 && Demangled) {
                 QString DemangledStr = QString::fromUtf8(Demangled);
                 Db->SetName(Exp.Addr, DemangledStr);
@@ -3765,7 +3781,7 @@ void AnalysisWorker::DemangleNames() {
         if (Name.startsWith("_Z") && !Db->HasFunction(It.key())) {
             QByteArray Bytes = Name.toLatin1();
             int Status = 0;
-            char* Demangled = abi::__cxa_demangle(Bytes.constData(), nullptr, nullptr, &Status);
+            char* Demangled = FidraCxaDemangle(Bytes.constData(), nullptr, nullptr, &Status);
             if (Status == 0 && Demangled) {
                 Db->SetName(It.key(), QString::fromUtf8(Demangled));
                 DemangledCount++;
@@ -3994,7 +4010,7 @@ void AnalysisWorker::ParseRtti() {
         QByteArray PrefixedBytes = Prefixed.toLatin1();
 
         int Status = 0;
-        char* Result = abi::__cxa_demangle(PrefixedBytes.constData(), nullptr, nullptr, &Status);
+        char* Result = FidraCxaDemangle(PrefixedBytes.constData(), nullptr, nullptr, &Status);
         if (Status == 0 && Result) {
             QString Demangled = QString::fromUtf8(Result);
             std::free(Result);
@@ -4002,7 +4018,7 @@ void AnalysisWorker::ParseRtti() {
         }
 
         Status = 0;
-        Result = abi::__cxa_demangle(Bytes.constData(), nullptr, nullptr, &Status);
+        Result = FidraCxaDemangle(Bytes.constData(), nullptr, nullptr, &Status);
         if (Status == 0 && Result) {
             QString Demangled = QString::fromUtf8(Result);
             std::free(Result);
