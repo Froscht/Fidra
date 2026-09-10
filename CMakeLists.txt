@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(Fidra VERSION 1.0.0 LANGUAGES CXX)
+project(Fidra VERSION 1.0.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -65,7 +65,18 @@ option(FIDRA_ENABLE_TRITON "Build Triton submodule for symbolic execution / vuln
 
 if(FIDRA_ENABLE_LIBDECOMP)
     if(EXISTS ${CMAKE_SOURCE_DIR}/third_party/libdecomp/CMakeLists.txt)
-        add_subdirectory(third_party/libdecomp EXCLUDE_FROM_ALL)
+        # libdecomp's own CMakeLists uses ${CMAKE_SOURCE_DIR} internally which
+        # breaks when consumed as add_subdirectory. Build it ourselves.
+        file(GLOB_RECURSE _LIBDECOMP_SRC CONFIGURE_DEPENDS
+            ${CMAKE_SOURCE_DIR}/third_party/libdecomp/libdecomp/*.c)
+        add_library(libdecomp STATIC ${_LIBDECOMP_SRC})
+        target_include_directories(libdecomp PUBLIC
+            ${CMAKE_SOURCE_DIR}/third_party/libdecomp/include)
+        target_compile_definitions(libdecomp PRIVATE
+            LIBDECOMP_VERSION_MAJOR=0 LIBDECOMP_VERSION_MINOR=1
+            LIBDECOMP_ENABLE_BUILTIN_BACKEND_CAPSTONE=1)
+        target_link_libraries(libdecomp PUBLIC capstone)
+        target_compile_options(libdecomp PRIVATE -Wno-unused-parameter -Wno-unused-variable -Wno-unused-but-set-variable)
     else()
         message(FATAL_ERROR "FIDRA_ENABLE_LIBDECOMP set but third_party/libdecomp is empty. Run: git submodule update --init --recursive")
     endif()
