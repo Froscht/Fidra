@@ -2156,16 +2156,41 @@ void AnalysisWorker::AnalyzeFunctions() {
     int Total = AllFuncs.size();
     QAtomicInt Done(0);
 
+    // Snapshot BinaryInfo once — was called per-function inside AnalyzeFunction
+    // which copies the whole struct (all segments + imports + exports) every
+    // time under a read lock. On 300k+ functions that alone dominated the pass.
+    BinaryInfo InfoSnapshot = Db->GetBinaryInfo();
+    bool Is64BitSnapshot = InfoSnapshot.Is64Bit;
+
+    // Snapshot xrefs-to-any-function-start once. GetXrefsTo() per func was
+    // taking a read lock and building a QList each time.
+    QHash<Address, QList<Address>> CallersByFunc;
+    {
+        QSet<Address> FuncStartSet;
+        FuncStartSet.reserve(Total);
+        for (const auto& F : AllFuncs) FuncStartSet.insert(F.Start);
+        // Iterate xrefs once via the DB API: no bulk getter, so use per-func
+        // GetXrefsTo but only for CodeCall type. Fold into a hash.
+        for (Address S : FuncStartSet) {
+            if (Cancelled.loadRelaxed()) return;
+            QList<Xref> Xs = Db->GetXrefsTo(S);
+            QList<Address>& Bucket = CallersByFunc[S];
+            for (const auto& X : Xs) {
+                if (X.Type == XrefType::CodeCall) Bucket.append(X.From);
+            }
+        }
+    }
+
     int BatchSize = std::max(1, Total / (QThread::idealThreadCount() * 4));
     QList<QFuture<void>> Futures;
 
     for (int Start = 0; Start < Total; Start += BatchSize) {
         int End = std::min(Start + BatchSize, Total);
-        QFuture<void> Future = QtConcurrent::run([this, &AllFuncs, &Done, Total, Start, End]() {
+        QFuture<void> Future = QtConcurrent::run([this, &AllFuncs, &Done, &InfoSnapshot, Is64BitSnapshot, &CallersByFunc, Total, Start, End]() {
             QThread::currentThread()->setPriority(QThread::LowPriority);
             for (int I = Start; I < End; ++I) {
                 if (Cancelled.loadRelaxed()) return;
-                AnalyzeFunction(AllFuncs[I]);
+                AnalyzeFunction(AllFuncs[I], InfoSnapshot, Is64BitSnapshot, CallersByFunc);
                 Db->UpdateFunction(AllFuncs[I].Start, AllFuncs[I]);
                 int D = Done.fetchAndAddRelaxed(1) + 1;
                 if (D % 500 == 0) {
@@ -2183,22 +2208,23 @@ void AnalysisWorker::AnalyzeFunctions() {
     }
 }
 
-void AnalysisWorker::AnalyzeFunction(AnalyzedFunction& Func) {
-    BinaryInfo Info = Db->GetBinaryInfo();
-
+void AnalysisWorker::AnalyzeFunction(AnalyzedFunction& Func,
+                                     const BinaryInfo& Info,
+                                     bool Is64Bit,
+                                     const QHash<Address, QList<Address>>& CallersByFunc) {
     QList<AnalyzedInstruction> Insns = Db->GetInstructions(Func.Start, Func.End);
     Func.InstructionCount = Insns.size();
 
-    QList<Xref> XrefsTo = Db->GetXrefsTo(Func.Start);
-    for (const auto& Ref : XrefsTo) {
-        if (Ref.Type == XrefType::CodeCall) {
-            Func.Callers.append(Ref.From);
-        }
+    auto CIt = CallersByFunc.constFind(Func.Start);
+    if (CIt != CallersByFunc.constEnd()) {
+        Func.Callers = CIt.value();
     }
 
+    QSet<Address> CalleeSet;
     for (const auto& Insn : Insns) {
         if (Insn.IsCall && Insn.BranchTarget != 0) {
-            if (!Func.Callees.contains(Insn.BranchTarget)) {
+            if (!CalleeSet.contains(Insn.BranchTarget)) {
+                CalleeSet.insert(Insn.BranchTarget);
                 Func.Callees.append(Insn.BranchTarget);
             }
         }
@@ -2213,8 +2239,9 @@ void AnalysisWorker::AnalyzeFunction(AnalyzedFunction& Func) {
     }
 
     Func.StackFrameSize = ComputeStackFrameEquation(Insns, Func.Blocks);
-    Func.Convention = DetectCallingConvention(Insns, Info.Is64Bit);
-    Func.ArgCount = DetectArgCount(Insns, Info.Is64Bit, Func.Convention);
+    Func.Convention = DetectCallingConvention(Insns, Is64Bit);
+    Func.ArgCount = DetectArgCount(Insns, Is64Bit, Func.Convention);
+    (void)Info;
 }
 
 void AnalysisWorker::BuildBasicBlocks(AnalyzedFunction& Func, const QList<AnalyzedInstruction>& Insns) {

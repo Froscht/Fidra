@@ -44,7 +44,10 @@ private:
 
     void FindFunctions();
     void AnalyzeFunctions();
-    void AnalyzeFunction(AnalyzedFunction& Func);
+    void AnalyzeFunction(AnalyzedFunction& Func,
+                         const BinaryInfo& Info,
+                         bool Is64Bit,
+                         const QHash<Address, QList<Address>>& CallersByFunc);
     void BuildBasicBlocks(AnalyzedFunction& Func, const QList<AnalyzedInstruction>& Insns);
     void ComputeDominance(AnalyzedFunction& Func);
     void DetectLoops(AnalyzedFunction& Func);
