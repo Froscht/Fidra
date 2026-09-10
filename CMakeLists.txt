@@ -117,6 +117,11 @@ if(Qt6WebEngineWidgets_FOUND)
     add_subdirectory(src/browser)
 endif()
 
+option(FIDRA_BUILD_MULTIBINARY "Build multibinary index/project module (ported from AiDA)" OFF)
+if(FIDRA_BUILD_MULTIBINARY)
+    add_subdirectory(src/multibinary)
+endif()
+
 option(FIDRA_BUILD_TESTS "Build the analysis test driver" OFF)
 if(FIDRA_BUILD_TESTS)
     add_executable(fidra_test_analysis test_analysis.cpp)

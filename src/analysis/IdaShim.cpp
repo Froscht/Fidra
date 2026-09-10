@@ -805,3 +805,30 @@ cfuncptr_t decompile(func_t* pfn, hexrays_failure_t* hf, int /*flags*/) {
 cfuncptr_t decompile(ea_t ea, hexrays_failure_t* hf, int flags) {
     return decompile(get_func(ea), hf, flags);
 }
+
+// -------- nalt.hpp / entry.hpp deferred impls --------
+
+#include <fidra/ida-compat/nalt.hpp>
+#include <fidra/ida-compat/entry.hpp>
+
+ea_t get_imagebase() {
+    auto* Db = Fidra::IdaShim::CurrentDb();
+    return Db ? Db->GetBinaryInfo().ImageBase : 0;
+}
+
+int get_import_module_qty() {
+    auto* Db = Fidra::IdaShim::CurrentDb();
+    return Db ? Db->GetBinaryInfo().Imports.size() : 0;
+}
+
+size_t get_entry_qty() {
+    auto* Db = Fidra::IdaShim::CurrentDb();
+    return Db ? static_cast<size_t>(Db->GetBinaryInfo().Exports.size()) : 0;
+}
+
+uval_t get_entry_ordinal(size_t idx) {
+    auto* Db = Fidra::IdaShim::CurrentDb();
+    if (!Db) return 0;
+    const auto& E = Db->GetBinaryInfo().Exports;
+    return idx < static_cast<size_t>(E.size()) ? E[idx].Ordinal : 0;
+}

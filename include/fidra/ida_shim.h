@@ -54,6 +54,11 @@ using uint = unsigned int;
 // IDA's qvector is a std::vector alias for our purposes.
 template<typename T> using qvector = std::vector<T>;
 
+// IDA's platform calling-convention marker — no-op on host compiler.
+#ifndef idaapi
+#define idaapi
+#endif
+
 constexpr ea_t BADADDR = static_cast<ea_t>(-1);
 constexpr sel_t BADSEL = static_cast<sel_t>(-1);
 constexpr nodeidx_t BADNODE = static_cast<nodeidx_t>(-1);
