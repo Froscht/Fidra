@@ -34,6 +34,10 @@
 #include "../symbols/SymbolModule.h"
 #include "../scripting/ScriptModule.h"
 #include "../graphrag/GraphRagModule.h"
+#include "../vuln/VulnModule.h"
+#ifdef FIDRA_HAS_MULTIBINARY
+#include "../multibinary/MultibinaryModule.h"
+#endif
 
 #ifdef FIDRA_HAS_WEBENGINE
 #include "../browser/BrowserModule.h"
@@ -505,6 +509,10 @@ int main(int Argc, char* Argv[]) {
     MainWindow.RegisterModule(new Fidra::SymbolModule());
     MainWindow.RegisterModule(new Fidra::ScriptModule());
     MainWindow.RegisterModule(new Fidra::GraphRagModule());
+    MainWindow.RegisterModule(new Fidra::VulnModule());
+#ifdef FIDRA_HAS_MULTIBINARY
+    MainWindow.RegisterModule(new Fidra::MultibinaryModule());
+#endif
 
 #ifdef FIDRA_HAS_WEBENGINE
     MainWindow.RegisterModule(new Fidra::BrowserModule());

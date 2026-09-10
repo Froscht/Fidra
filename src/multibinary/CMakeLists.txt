@@ -9,9 +9,12 @@ set(MULTIBINARY_SOURCES
     MultibinaryIndex.h
     MultibinaryProject.h
     MultibinaryProject.cpp
+    MultibinaryModule.h
+    MultibinaryModule.cpp
 )
 
 add_library(fidra_multibinary STATIC ${MULTIBINARY_SOURCES})
+set_target_properties(fidra_multibinary PROPERTIES AUTOMOC ON)
 
 target_include_directories(fidra_multibinary PUBLIC
     ${FIDRA_INCLUDE_DIR}

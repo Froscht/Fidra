@@ -43,7 +43,13 @@ target_link_libraries(Fidra PRIVATE
     fidra_callgraph
     fidra_bindiff
     fidra_graphrag
+    fidra_vuln
 )
+
+if(TARGET fidra_multibinary)
+    target_link_libraries(Fidra PRIVATE fidra_multibinary)
+    target_compile_definitions(Fidra PRIVATE FIDRA_HAS_MULTIBINARY)
+endif()
 
 if(Qt6WebEngineWidgets_FOUND)
     target_link_libraries(Fidra PRIVATE Qt6::WebEngineWidgets fidra_browser)

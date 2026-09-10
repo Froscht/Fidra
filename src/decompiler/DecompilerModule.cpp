@@ -1,5 +1,13 @@
 #include "DecompilerModule.h"
 #include "DecompilerWidget.h"
+#include "Lifter.h"
+#include "Optimizer.h"
+#include "CodeGenerator.h"
+#include "../analysis/AnalysisDatabase.h"
+
+#include <fidra/hexrays_shim.h>
+#include <fidra/ida_shim.h>
+
 #include <QStyle>
 #include <QApplication>
 #include <QTabWidget>
@@ -59,7 +67,24 @@ void DecompilerModule::Initialize(ICore* Core) {
         }
     });
 
-    CoreRef->Log(QStringLiteral("Decompiler module initialized"));
+    // Bridge Hexrays shim's decompile() to Fidra's own decompiler pipeline.
+    // Vuln/multibinary chain code that calls decompile(func_t*) now gets real
+    // pseudocode text back instead of nullptr.
+    Fidra::HexraysShim::SetDecompiler([](ea_t Ea) -> std::string {
+        auto* Db = Fidra::IdaShim::CurrentDb();
+        if (!Db) return {};
+        AnalyzedFunction Func = Db->GetFunctionContaining(static_cast<Address>(Ea));
+        if (Func.Start == 0 && Func.End == 0) return {};
+        Decomp::Lifter Lft;
+        Decomp::IrFunction IrFunc = Lft.LiftFunction(Func, Db);
+        Decomp::Optimizer Opt;
+        IrFunc = Opt.Optimize(IrFunc);
+        Decomp::CodeGenerator Gen;
+        Decomp::DecompOutput Out = Gen.Generate(IrFunc, Db);
+        return Out.PseudoC.toStdString();
+    });
+
+    CoreRef->Log(QStringLiteral("Decompiler module initialized (Hexrays bridge armed)"));
 }
 
 void DecompilerModule::Shutdown() {

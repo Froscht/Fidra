@@ -34,6 +34,8 @@ set(VULN_SOURCES
     # vuln_callsites.cpp — blocked: 198 errors, hexrays vd_failure_t + decompile_cache_t
     # vuln_strings.cpp — blocked: string literal type traversal + hexrays visit_expr
     vuln_tools.cpp
+    VulnModule.h
+    VulnModule.cpp
 )
 
 # Blocked without Z3 - excluded until libz3 wired in.
@@ -55,10 +57,14 @@ target_include_directories(fidra_vuln PRIVATE
 
 target_link_libraries(fidra_vuln PUBLIC
     Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
     fidra_analysis
     nlohmann_json::nlohmann_json
     capstone
 )
+
+set_target_properties(fidra_vuln PROPERTIES AUTOMOC ON)
 
 target_compile_definitions(fidra_vuln PRIVATE
     FIDRA_VULN=1

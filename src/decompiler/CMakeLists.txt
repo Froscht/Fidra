@@ -27,6 +27,7 @@ target_link_libraries(fidra_decompiler PRIVATE
     Qt6::Gui
     Qt6::Widgets
     capstone
+    fidra_analysis
 )
 
 if(FIDRA_ENABLE_LIBDECOMP AND TARGET libdecomp)

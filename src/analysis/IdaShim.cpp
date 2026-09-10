@@ -791,15 +791,48 @@ bool netnode::hashdel(const char* idx, char tag) {
     return S.Nodes[node_name].Hash.erase(Key) > 0;
 }
 
-// -------- Hexrays tier-2 stubs (compile only) --------
+// -------- Hexrays bridge --------
+
+namespace {
+    Fidra::HexraysShim::DecompileCallback& DecompilerCb() {
+        static Fidra::HexraysShim::DecompileCallback Cb;
+        return Cb;
+    }
+}
+
+namespace Fidra::HexraysShim {
+    void SetDecompiler(DecompileCallback cb) { DecompilerCb() = std::move(cb); }
+    bool HasDecompiler() { return static_cast<bool>(DecompilerCb()); }
+}
 
 cfuncptr_t decompile(func_t* pfn, hexrays_failure_t* hf, int /*flags*/) {
-    if (hf) {
-        hf->code = -1;
-        hf->errea = pfn ? pfn->start_ea : BADADDR;
-        hf->desc = "Fidra: hexrays shim — no decompiler bound";
+    if (!pfn) {
+        if (hf) { hf->code = -1; hf->errea = BADADDR; hf->desc = "Fidra: decompile(nullptr)"; }
+        return nullptr;
     }
-    return nullptr;
+    auto& Cb = DecompilerCb();
+    if (!Cb) {
+        if (hf) { hf->code = -1; hf->errea = pfn->start_ea; hf->desc = "Fidra: no decompiler bound"; }
+        return nullptr;
+    }
+    std::string Text = Cb(pfn->start_ea);
+    if (Text.empty()) {
+        if (hf) { hf->code = -2; hf->errea = pfn->start_ea; hf->desc = "Fidra: decompiler returned empty"; }
+        return nullptr;
+    }
+    auto Cf = std::make_shared<cfunc_t>();
+    Cf->start_ea = pfn->start_ea;
+    Cf->pseudocode = Text;
+    // Split into strvec_t lines
+    Cf->pseudocode_lines.clear();
+    size_t Pos = 0;
+    while (Pos < Text.size()) {
+        size_t Nl = Text.find('\n', Pos);
+        if (Nl == std::string::npos) Nl = Text.size();
+        Cf->pseudocode_lines.emplace_back(Text.substr(Pos, Nl - Pos));
+        Pos = Nl + 1;
+    }
+    return Cf;
 }
 
 cfuncptr_t decompile(ea_t ea, hexrays_failure_t* hf, int flags) {

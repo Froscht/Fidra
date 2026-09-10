@@ -118,7 +118,7 @@ if(Qt6WebEngineWidgets_FOUND)
     add_subdirectory(src/browser)
 endif()
 
-option(FIDRA_BUILD_MULTIBINARY "Build multibinary index/project module (ported from AiDA)" OFF)
+option(FIDRA_BUILD_MULTIBINARY "Build multibinary index/project module (ported from AiDA)" ON)
 if(FIDRA_BUILD_MULTIBINARY)
     add_subdirectory(src/multibinary)
 endif()

@@ -11,6 +11,16 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <functional>
+
+namespace Fidra::HexraysShim {
+    // Runtime callback wired by src/decompiler/DecompilerModule.
+    // Returns pseudocode text (multi-line) for the function at the given EA.
+    // Returning an empty string means no output available.
+    using DecompileCallback = std::function<std::string(ea_t)>;
+    void SetDecompiler(DecompileCallback cb);
+    bool HasDecompiler();
+}
 
 // Hexrays ctree item type ids (subset — only referenced values enumerated)
 enum ctype_t {
