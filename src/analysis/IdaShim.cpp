@@ -7,6 +7,11 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#include <set>
+#include <map>
+#include <algorithm>
+
+#include <QString>
 
 namespace {
 
@@ -31,7 +36,6 @@ std::unique_ptr<func_t> BuildFunc(const Fidra::AnalyzedFunction& F) {
     auto Out = std::make_unique<func_t>();
     Out->start_ea = F.Start;
     Out->end_ea = F.End;
-    Out->size = F.Size;
     Out->argsize = static_cast<uint32_t>(F.ArgCount * 8);
     Out->frsize = static_cast<uint32_t>(F.StackFrameSize);
     if (F.IsThunk) Out->flags |= FUNC_THUNK;
@@ -432,6 +436,359 @@ bool xrefblk_t::next_to() {
     type = pending[cursor].second;
     iscode = (type >= fl_CF) ? 1 : 0;
     return true;
+}
+
+// -------- qstring-form name/segment/comment accessors --------
+
+static ssize_t WriteQ(qstring* out, const std::string& s) {
+    if (!out) return 0;
+    *out = s;
+    return static_cast<ssize_t>(s.size());
+}
+
+ssize_t get_func_name(qstring* out, ea_t ea) {
+    return WriteQ(out, get_func_name(ea));
+}
+ssize_t get_name(qstring* out, ea_t ea) {
+    return WriteQ(out, get_name(ea));
+}
+ssize_t get_short_name(qstring* out, ea_t ea) {
+    return WriteQ(out, get_short_name(ea));
+}
+ssize_t get_long_name(qstring* out, ea_t ea) {
+    return WriteQ(out, get_long_name(ea));
+}
+ssize_t get_ea_name(qstring* out, ea_t ea, int /*flags*/) {
+    return WriteQ(out, get_name(ea));
+}
+ssize_t get_cmt(qstring* out, ea_t ea, bool repeatable) {
+    return WriteQ(out, get_cmt(ea, repeatable));
+}
+ssize_t get_segm_name(qstring* out, const segment_t* seg) {
+    return WriteQ(out, get_segm_name(seg));
+}
+ssize_t inf_get_procname(qstring* out) {
+    return WriteQ(out, inf_get_procname());
+}
+
+// -------- get_name_ea (reverse lookup) --------
+
+ea_t get_name_ea(ea_t /*from*/, const char* name) {
+    if (!name) return BADADDR;
+    auto* Db = State().Db;
+    if (!Db) return BADADDR;
+    QString Wanted = QString::fromUtf8(name);
+    ea_t Found = BADADDR;
+    for (auto It = Db->GetAllNames().constBegin(); It != Db->GetAllNames().constEnd(); ++It) {
+        if (It.value() == Wanted) { Found = It.key(); break; }
+    }
+    return Found;
+}
+
+// -------- flags64_t alias --------
+
+flags64_t get_flags64(ea_t ea) { return static_cast<flags64_t>(get_flags(ea)); }
+
+// -------- Instruction decoding --------
+
+int decode_insn(insn_t* out, ea_t ea) {
+    if (!out) return 0;
+    auto* Db = State().Db;
+    if (!Db) return 0;
+    if (!Db->HasInstruction(ea)) return 0;
+    auto I = Db->GetInstruction(ea);
+    out->ea = ea;
+    out->size = I.Size;
+    out->itype = 0;
+    if (I.BranchTarget != 0) {
+        out->ops[0].type = o_near;
+        out->ops[0].addr = I.BranchTarget;
+    }
+    return I.Size;
+}
+
+bool is_call_insn(const insn_t& insn) {
+    auto* Db = State().Db;
+    if (!Db) return false;
+    if (!Db->HasInstruction(insn.ea)) return false;
+    return Db->GetInstruction(insn.ea).IsCall;
+}
+
+bool is_ret_insn(const insn_t& insn) {
+    auto* Db = State().Db;
+    if (!Db) return false;
+    if (!Db->HasInstruction(insn.ea)) return false;
+    return Db->GetInstruction(insn.ea).IsRet;
+}
+
+bool is_indirect_jump_insn(const insn_t& insn) {
+    auto* Db = State().Db;
+    if (!Db) return false;
+    if (!Db->HasInstruction(insn.ea)) return false;
+    return Db->GetInstruction(insn.ea).IsIndirectJump;
+}
+
+ea_t next_head(ea_t ea, ea_t /*maxea*/) {
+    auto* Db = State().Db;
+    if (!Db) return BADADDR;
+    if (!Db->HasInstruction(ea)) return BADADDR;
+    return ea + Db->GetInstruction(ea).Size;
+}
+
+ea_t prev_head(ea_t ea, ea_t /*minea*/) {
+    if (ea == 0) return BADADDR;
+    return ea - 1;  // very approximate
+}
+
+// -------- Imports / exports (subset) --------
+
+uint get_import_module_qty() {
+    auto* Db = State().Db;
+    if (!Db) return 0;
+    std::set<QString> Dlls;
+    for (const auto& I : Db->GetBinaryInfo().Imports) Dlls.insert(I.DllName);
+    return static_cast<uint>(Dlls.size());
+}
+
+bool get_import_module_name(qstring* out, int idx) {
+    if (!out) return false;
+    auto* Db = State().Db;
+    if (!Db) return false;
+    std::set<QString> Dlls;
+    for (const auto& I : Db->GetBinaryInfo().Imports) Dlls.insert(I.DllName);
+    int i = 0;
+    for (const auto& D : Dlls) {
+        if (i == idx) { *out = D.toStdString(); return true; }
+        ++i;
+    }
+    return false;
+}
+
+int enum_import_names(int idx, import_enum_cb_t cb, void* ctx) {
+    if (!cb) return 0;
+    auto* Db = State().Db;
+    if (!Db) return 0;
+    std::set<QString> Dlls;
+    for (const auto& I : Db->GetBinaryInfo().Imports) Dlls.insert(I.DllName);
+    QString Target;
+    int i = 0;
+    for (const auto& D : Dlls) {
+        if (i == idx) { Target = D; break; }
+        ++i;
+    }
+    if (Target.isEmpty()) return 0;
+    int Called = 0;
+    for (const auto& I : Db->GetBinaryInfo().Imports) {
+        if (I.DllName != Target) continue;
+        auto NameStd = I.FuncName.toStdString();
+        int Rc = cb(I.IatAddress, NameStd.c_str(), I.Ordinal, ctx);
+        ++Called;
+        if (Rc == 0) break;
+    }
+    return Called;
+}
+
+size_t get_entry_qty() {
+    auto* Db = State().Db;
+    return Db ? static_cast<size_t>(Db->GetBinaryInfo().Exports.size()) : 0;
+}
+
+ea_t get_entry(uint64_t ordinal) {
+    auto* Db = State().Db;
+    if (!Db) return BADADDR;
+    for (const auto& E : Db->GetBinaryInfo().Exports) {
+        if (E.Ordinal == ordinal) return E.Addr;
+    }
+    return BADADDR;
+}
+
+uint64_t get_entry_ordinal(size_t idx) {
+    auto* Db = State().Db;
+    if (!Db) return 0;
+    const auto& Exp = Db->GetBinaryInfo().Exports;
+    if (idx >= static_cast<size_t>(Exp.size())) return 0;
+    return Exp[idx].Ordinal;
+}
+
+ssize_t get_entry_name(qstring* out, uint64_t ord) {
+    if (!out) return 0;
+    auto* Db = State().Db;
+    if (!Db) return 0;
+    for (const auto& E : Db->GetBinaryInfo().Exports) {
+        if (E.Ordinal == ord) { *out = E.Name.toStdString(); return E.Name.size(); }
+    }
+    return 0;
+}
+
+// -------- Binary hash --------
+
+bool retrieve_input_file_md5(uchar out[16]) {
+    if (!out) return false;
+    std::memset(out, 0, 16);
+    auto* Db = State().Db;
+    if (!Db) return false;
+    // Fidra does not persist a computed MD5 yet; derive a stable pseudo-hash
+    // from the file path so callers get deterministic-but-fake identity.
+    QString P = Db->GetBinaryInfo().FilePath;
+    auto B = P.toUtf8();
+    for (int i = 0; i < B.size(); ++i) out[i % 16] ^= static_cast<uchar>(B[i]);
+    return true;
+}
+
+bool retrieve_input_file_sha256(uchar out[32]) {
+    if (!out) return false;
+    std::memset(out, 0, 32);
+    auto* Db = State().Db;
+    if (!Db) return false;
+    QString P = Db->GetBinaryInfo().FilePath;
+    auto B = P.toUtf8();
+    for (int i = 0; i < B.size(); ++i) out[i % 32] ^= static_cast<uchar>(B[i]);
+    return true;
+}
+
+qstring get_input_file_path() {
+    auto* Db = State().Db;
+    return Db ? qstring(Db->GetBinaryInfo().FilePath.toStdString()) : qstring();
+}
+
+qstring get_root_filename() {
+    auto* Db = State().Db;
+    return Db ? qstring(Db->GetBinaryInfo().FileName.toStdString()) : qstring();
+}
+
+// -------- Netnode (in-memory KV keyed by node name) --------
+
+namespace {
+struct NetnodeStore {
+    std::mutex Mtx;
+    struct Node {
+        std::map<uint64_t, std::vector<uint8_t>> Blobs;
+        std::map<uint64_t, uint32_t> Alt;
+        std::map<uint64_t, std::vector<uint8_t>> Sup;
+        std::map<std::string, std::vector<uint8_t>> Hash;
+    };
+    std::unordered_map<std::string, Node> Nodes;
+
+    Node& NodeFor(const std::string& Name) { return Nodes[Name]; }
+};
+NetnodeStore& NNS() { static NetnodeStore S; return S; }
+}
+
+ssize_t netnode::supval(nodeidx_t alt, void* buf, size_t maxsize, char tag) const {
+    if (!buf || maxsize == 0) return -1;
+    uint64_t Key = (uint64_t(tag) << 32) | alt;
+    auto& S = NNS();
+    std::lock_guard<std::mutex> Lock(S.Mtx);
+    auto& N = S.Nodes[node_name];
+    auto It = N.Sup.find(Key);
+    if (It == N.Sup.end()) return -1;
+    size_t Copy = std::min(maxsize, It->second.size());
+    std::memcpy(buf, It->second.data(), Copy);
+    return static_cast<ssize_t>(Copy);
+}
+
+bool netnode::supset(nodeidx_t alt, const void* value, size_t length, char tag) {
+    if (!value) return false;
+    uint64_t Key = (uint64_t(tag) << 32) | alt;
+    auto& S = NNS();
+    std::lock_guard<std::mutex> Lock(S.Mtx);
+    auto& V = S.Nodes[node_name].Sup[Key];
+    V.assign(reinterpret_cast<const uint8_t*>(value),
+             reinterpret_cast<const uint8_t*>(value) + (length ? length : std::strlen(reinterpret_cast<const char*>(value))));
+    return true;
+}
+
+bool netnode::supdel(nodeidx_t alt, char tag) {
+    uint64_t Key = (uint64_t(tag) << 32) | alt;
+    auto& S = NNS();
+    std::lock_guard<std::mutex> Lock(S.Mtx);
+    return S.Nodes[node_name].Sup.erase(Key) > 0;
+}
+
+uint32_t netnode::altval(nodeidx_t alt, char tag) const {
+    uint64_t Key = (uint64_t(tag) << 32) | alt;
+    auto& S = NNS();
+    std::lock_guard<std::mutex> Lock(S.Mtx);
+    auto& N = S.Nodes[node_name];
+    auto It = N.Alt.find(Key);
+    return It == N.Alt.end() ? 0 : It->second;
+}
+
+bool netnode::altset(nodeidx_t alt, uint32_t value, char tag) {
+    uint64_t Key = (uint64_t(tag) << 32) | alt;
+    auto& S = NNS();
+    std::lock_guard<std::mutex> Lock(S.Mtx);
+    S.Nodes[node_name].Alt[Key] = value;
+    return true;
+}
+
+bool netnode::altdel(nodeidx_t alt, char tag) {
+    uint64_t Key = (uint64_t(tag) << 32) | alt;
+    auto& S = NNS();
+    std::lock_guard<std::mutex> Lock(S.Mtx);
+    return S.Nodes[node_name].Alt.erase(Key) > 0;
+}
+
+ssize_t netnode::getblob(void* out, nodeidx_t start, char tag) const {
+    if (!out) return -1;
+    uint64_t Key = (uint64_t(tag) << 32) | start;
+    auto& S = NNS();
+    std::lock_guard<std::mutex> Lock(S.Mtx);
+    auto& N = S.Nodes[node_name];
+    auto It = N.Blobs.find(Key);
+    if (It == N.Blobs.end()) return -1;
+    std::memcpy(out, It->second.data(), It->second.size());
+    return static_cast<ssize_t>(It->second.size());
+}
+
+bool netnode::setblob(const void* data, size_t size, nodeidx_t start, char tag) {
+    if (!data) return false;
+    uint64_t Key = (uint64_t(tag) << 32) | start;
+    auto& S = NNS();
+    std::lock_guard<std::mutex> Lock(S.Mtx);
+    auto& V = S.Nodes[node_name].Blobs[Key];
+    V.assign(reinterpret_cast<const uint8_t*>(data),
+             reinterpret_cast<const uint8_t*>(data) + size);
+    return true;
+}
+
+bool netnode::delblob(nodeidx_t start, char tag) {
+    uint64_t Key = (uint64_t(tag) << 32) | start;
+    auto& S = NNS();
+    std::lock_guard<std::mutex> Lock(S.Mtx);
+    return S.Nodes[node_name].Blobs.erase(Key) > 0;
+}
+
+ssize_t netnode::hashval(const char* idx, void* buf, size_t maxsize, char tag) const {
+    if (!idx || !buf) return -1;
+    std::string Key = std::string(1, tag) + idx;
+    auto& S = NNS();
+    std::lock_guard<std::mutex> Lock(S.Mtx);
+    auto& N = S.Nodes[node_name];
+    auto It = N.Hash.find(Key);
+    if (It == N.Hash.end()) return -1;
+    size_t Copy = std::min(maxsize, It->second.size());
+    std::memcpy(buf, It->second.data(), Copy);
+    return static_cast<ssize_t>(Copy);
+}
+
+bool netnode::hashset(const char* idx, const void* value, size_t length, char tag) {
+    if (!idx || !value) return false;
+    std::string Key = std::string(1, tag) + idx;
+    auto& S = NNS();
+    std::lock_guard<std::mutex> Lock(S.Mtx);
+    auto& V = S.Nodes[node_name].Hash[Key];
+    V.assign(reinterpret_cast<const uint8_t*>(value),
+             reinterpret_cast<const uint8_t*>(value) + (length ? length : std::strlen(reinterpret_cast<const char*>(value))));
+    return true;
+}
+
+bool netnode::hashdel(const char* idx, char tag) {
+    if (!idx) return false;
+    std::string Key = std::string(1, tag) + idx;
+    auto& S = NNS();
+    std::lock_guard<std::mutex> Lock(S.Mtx);
+    return S.Nodes[node_name].Hash.erase(Key) > 0;
 }
 
 // -------- Hexrays tier-2 stubs (compile only) --------

@@ -42,6 +42,7 @@ target_link_libraries(Fidra PRIVATE
     fidra_scripting
     fidra_callgraph
     fidra_bindiff
+    fidra_graphrag
 )
 
 if(Qt6WebEngineWidgets_FOUND)
