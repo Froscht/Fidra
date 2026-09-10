@@ -60,6 +60,28 @@ FetchContent_MakeAvailable(LIEF)
 
 set(FIDRA_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/include)
 
+option(FIDRA_ENABLE_LIBDECOMP "Build libdecomp submodule as alternate decompiler backend" OFF)
+option(FIDRA_ENABLE_TRITON "Build Triton submodule for symbolic execution / vuln chains" OFF)
+
+if(FIDRA_ENABLE_LIBDECOMP)
+    if(EXISTS ${CMAKE_SOURCE_DIR}/third_party/libdecomp/CMakeLists.txt)
+        add_subdirectory(third_party/libdecomp EXCLUDE_FROM_ALL)
+    else()
+        message(FATAL_ERROR "FIDRA_ENABLE_LIBDECOMP set but third_party/libdecomp is empty. Run: git submodule update --init --recursive")
+    endif()
+endif()
+
+if(FIDRA_ENABLE_TRITON)
+    if(EXISTS ${CMAKE_SOURCE_DIR}/third_party/Triton/CMakeLists.txt)
+        set(TRITON_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(TRITON_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+        add_subdirectory(third_party/Triton EXCLUDE_FROM_ALL)
+    else()
+        message(FATAL_ERROR "FIDRA_ENABLE_TRITON set but third_party/Triton is empty. Run: git submodule update --init --recursive")
+    endif()
+endif()
+
 add_subdirectory(src/core)
 add_subdirectory(src/disasm)
 add_subdirectory(src/debugger)
