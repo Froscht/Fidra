@@ -30,6 +30,11 @@ using tid_t = uint64_t;
 using sel_t = uint64_t;
 using nodeidx_t = uint32_t;
 
+// IDA's platform calling-convention marker — no-op on host compiler.
+#ifndef idaapi
+#define idaapi
+#endif
+
 constexpr ea_t BADADDR = static_cast<ea_t>(-1);
 constexpr sel_t BADSEL = static_cast<sel_t>(-1);
 constexpr nodeidx_t BADNODE = static_cast<nodeidx_t>(-1);
