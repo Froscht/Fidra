@@ -1924,12 +1924,21 @@ void AnalysisWorker::FindStrings() {
             const uint8_t* SData = reinterpret_cast<const uint8_t*>(Seg.Data.constData());
             size_t SSize = static_cast<size_t>(Seg.Data.size());
 
+            // Snapshot code-address set for this segment once. Kills per-byte
+            // Db->GetItemType() lock — on huge binaries that was O(seg_size)
+            // atomic ops per pass, per segment, per thread.
+            QSet<Address> CodeAddrs;
+            {
+                QList<AnalyzedInstruction> In = Db->GetInstructions(Seg.VirtualAddress, Seg.VirtualAddress + SSize);
+                for (const auto& I : In) CodeAddrs.insert(I.Addr);
+            }
+
             for (size_t Off = 0; Off < SSize; ) {
                 if (Cancelled.loadRelaxed()) return;
 
                 Address Addr = Seg.VirtualAddress + Off;
 
-                if (Db->GetItemType(Addr) == ItemType::Code) {
+                if (CodeAddrs.contains(Addr)) {
                     Off++;
                     continue;
                 }
@@ -2715,14 +2724,24 @@ void AnalysisWorker::RunLinearSweep() {
         const uint8_t* SData = reinterpret_cast<const uint8_t*>(Seg.Data.constData());
         size_t SSize = static_cast<size_t>(Seg.Data.size());
 
+        // Snapshot known instruction addresses + sizes in this segment once.
+        // Avoids per-byte Db->HasInstruction() lock — for 100 MB segments the
+        // lock overhead alone was billions of atomic ops.
+        QHash<Address, uint8_t> KnownInsn;
+        {
+            QList<AnalyzedInstruction> In = Db->GetInstructions(Seg.VirtualAddress, Seg.VirtualAddress + SSize);
+            KnownInsn.reserve(In.size());
+            for (const auto& I : In) KnownInsn.insert(I.Addr, I.Size);
+        }
+
         for (size_t Off = 0; Off + 8 <= SSize; ) {
             if (Cancelled.loadRelaxed()) return;
 
             Address Addr = Seg.VirtualAddress + Off;
 
-            if (Db->HasInstruction(Addr)) {
-                auto Insn = Db->GetInstruction(Addr);
-                Off += Insn.Size > 0 ? Insn.Size : 1;
+            auto KIt = KnownInsn.constFind(Addr);
+            if (KIt != KnownInsn.constEnd()) {
+                Off += KIt.value() > 0 ? KIt.value() : 1;
                 continue;
             }
 
@@ -3197,6 +3216,15 @@ void AnalysisWorker::FillCodeGaps() {
         if (cs_open(CsArch, CsMode, &Handle) != CS_ERR_OK) continue;
         cs_option(Handle, CS_OPT_DETAIL, CS_OPT_ON);
 
+        // Snapshot known-instruction table for this segment — same reason as
+        // RunLinearSweep (avoid per-byte lock).
+        QHash<Address, uint8_t> KnownGap;
+        {
+            QList<AnalyzedInstruction> In = Db->GetInstructions(Seg.VirtualAddress, Seg.VirtualAddress + SSize);
+            KnownGap.reserve(In.size());
+            for (const auto& I : In) KnownGap.insert(I.Addr, I.Size);
+        }
+
         size_t Off = 0;
         while (Off < SSize) {
             if (Cancelled.loadRelaxed()) break;
@@ -3204,9 +3232,9 @@ void AnalysisWorker::FillCodeGaps() {
 
             Address Addr = Seg.VirtualAddress + Off;
 
-            if (Db->HasInstruction(Addr)) {
-                auto Insn = Db->GetInstruction(Addr);
-                Off += Insn.Size > 0 ? Insn.Size : 1;
+            auto KIt = KnownGap.constFind(Addr);
+            if (KIt != KnownGap.constEnd()) {
+                Off += KIt.value() > 0 ? KIt.value() : 1;
                 continue;
             }
 
@@ -3231,7 +3259,7 @@ void AnalysisWorker::FillCodeGaps() {
 
             for (size_t I = 0; I < Count; ++I) {
                 Address InsnAddr = Insns[I].address;
-                if (Db->HasInstruction(InsnAddr)) break;
+                if (KnownGap.contains(InsnAddr)) break;
 
                 QString Mn = QString::fromUtf8(Insns[I].mnemonic).toLower();
 
