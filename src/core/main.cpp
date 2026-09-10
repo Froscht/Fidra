@@ -35,6 +35,7 @@
 #include "../scripting/ScriptModule.h"
 #include "../graphrag/GraphRagModule.h"
 #include "../vuln/VulnModule.h"
+#include "../emulation/EmulationModule.h"
 #ifdef FIDRA_HAS_MULTIBINARY
 #include "../multibinary/MultibinaryModule.h"
 #endif
@@ -510,6 +511,7 @@ int main(int Argc, char* Argv[]) {
     MainWindow.RegisterModule(new Fidra::ScriptModule());
     MainWindow.RegisterModule(new Fidra::GraphRagModule());
     MainWindow.RegisterModule(new Fidra::VulnModule());
+    MainWindow.RegisterModule(new Fidra::EmulationModule());
 #ifdef FIDRA_HAS_MULTIBINARY
     MainWindow.RegisterModule(new Fidra::MultibinaryModule());
 #endif

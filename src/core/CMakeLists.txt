@@ -44,6 +44,7 @@ target_link_libraries(Fidra PRIVATE
     fidra_bindiff
     fidra_graphrag
     fidra_vuln
+    fidra_emulation
 )
 
 if(TARGET fidra_multibinary)

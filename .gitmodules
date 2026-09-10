@@ -4,3 +4,6 @@
 [submodule "third_party/Triton"]
 	path = third_party/Triton
 	url = https://github.com/JonathanSalwan/Triton.git
+[submodule "third_party/unicorn"]
+	path = third_party/unicorn
+	url = https://github.com/unicorn-engine/unicorn.git
