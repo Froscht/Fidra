@@ -335,7 +335,6 @@ ssize_t get_func_name(qstring* out, ea_t ea);
 ssize_t get_name(qstring* out, ea_t ea);
 ssize_t get_short_name(qstring* out, ea_t ea);
 ssize_t get_long_name(qstring* out, ea_t ea);
-ssize_t get_ea_name(qstring* out, ea_t ea, int flags = 0);
 std::string get_true_name(ea_t ea);
 std::string get_short_name(ea_t ea);
 std::string get_long_name(ea_t ea);
@@ -344,6 +343,9 @@ bool set_name(ea_t ea, const char* name, int flags = 0);
 // Reverse-lookup name -> ea (returns BADADDR if not found)
 ea_t get_name_ea(ea_t from, const char* name);
 inline ea_t get_name_ea_simple(const char* name) { return get_name_ea(BADADDR, name); }
+
+// Out-parameter forms: definitions live in IdaShim.cpp
+ssize_t get_ea_name(qstring* out, ea_t ea, int flags = 0);
 
 std::string get_cmt(ea_t ea, bool repeatable = false);
 ssize_t get_cmt(qstring* out, ea_t ea, bool repeatable = false);
@@ -404,7 +406,7 @@ inline ssize_t print_operand(qstring* out, ea_t /*ea*/, int /*n*/) { if (out) ou
 
 // -------------- Imports/exports (subset) --------------
 
-uint get_import_module_qty();
+int get_import_module_qty();
 bool get_import_module_name(qstring* out, int idx);
 using import_enum_cb_t = int (*)(ea_t ea, const char* name, uval_t ord, void* ctx);
 int enum_import_names(int idx, import_enum_cb_t cb, void* ctx = nullptr);
@@ -481,7 +483,7 @@ inline void tag_remove(qstring* out, const char* in) { if (out) *out = in ? in :
 inline qstring tag_remove(const qstring& in) { return in; }
 
 // -------------- Image base --------------
-inline ea_t get_imagebase() { return inf_get_min_ea(); }
+ea_t get_imagebase();
 
 // -------------- Line generation (stub — returns raw addr) --------------
 constexpr int GENDSM_REMOVE_TAGS = 0x0004;
@@ -517,5 +519,155 @@ public:
 // -------------- Callbacks — auto_wait, refresh --------------
 
 inline bool auto_wait() { return true; }
+inline bool auto_is_ok() { return true; }
 inline void request_refresh(int /*mask*/ = 0) {}
 using builtin_widgets_mask_t = uint32_t;
+
+// -------------- Additional shim symbols for vuln port --------------
+
+constexpr size_t QMAXPATH = 4096;
+constexpr int PATH_TYPE_CMD = 0;
+constexpr int PATH_TYPE_IDB = 1;
+constexpr int PATH_TYPE_ID0 = 2;
+
+inline uint32_t retrieve_input_file_crc32() { return 0; }
+inline bool inf_is_kernel_mode() { return false; }
+inline bool inf_is_be() { return false; }
+
+inline int get_segm_class(qstring* /*out*/, const segment_t* /*seg*/) { return 0; }
+inline int get_segm_class(const segment_t* /*seg*/, char* buf, size_t bufsize) {
+    if (buf && bufsize) buf[0] = 0; return 0;
+}
+
+// next_head/prev_head implemented in IdaShim.cpp
+inline ea_t next_addr(ea_t /*ea*/) { return BADADDR; }
+inline ea_t prev_addr(ea_t /*ea*/) { return BADADDR; }
+inline ea_t get_item_head(ea_t ea) { return ea; }
+inline ea_t get_item_end(ea_t ea) { return ea + 1; }
+inline asize_t get_item_size(ea_t /*ea*/) { return 1; }
+
+// STRTYPE_*
+constexpr int32_t STRTYPE_C          = 0;
+constexpr int32_t STRTYPE_C_16       = 1;
+constexpr int32_t STRTYPE_C_32       = 2;
+constexpr int32_t STRTYPE_PASCAL     = 3;
+constexpr int32_t STRTYPE_PASCAL_16  = 4;
+constexpr int32_t STRTYPE_LEN2       = 5;
+constexpr int32_t STRTYPE_LEN2_16    = 6;
+constexpr int32_t STRTYPE_LEN4       = 7;
+constexpr int32_t STRTYPE_LEN4_16    = 8;
+constexpr int32_t STRTYPE_TERMCHR    = 9;
+
+// NN_* instruction mnemonic constants (subset)
+enum : uint16_t {
+    NN_null = 0,
+    NN_call = 16,
+    NN_callfi = 17,
+    NN_callni = 18,
+    NN_jmp = 19,
+    NN_jmpfi = 20,
+    NN_jmpni = 21,
+    NN_ret = 22,
+    NN_retn = 23,
+    NN_retf = 24,
+};
+
+// qflow_chart_t / qbasic_block_t
+struct qbasic_block_t {
+    ea_t start_ea = 0;
+    ea_t end_ea = 0;
+    std::vector<int> succ_list;
+    std::vector<int> pred_list;
+    size_t size() const { return end_ea - start_ea; }
+};
+
+enum { FC_PREDS = 1, FC_APPND = 2, FC_NOEXT = 4, FC_CALL_ENDS = 8, FC_RESERVED = 0x100 };
+
+struct qflow_chart_t {
+    qstring title;
+    func_t* pfn = nullptr;
+    ea_t bounds_start = 0;
+    ea_t bounds_end = 0;
+    int flags = 0;
+    std::vector<qbasic_block_t> blocks;
+    qflow_chart_t() = default;
+    qflow_chart_t(const char* /*t*/, func_t* p, ea_t s, ea_t e, int f)
+        : pfn(p), bounds_start(s), bounds_end(e), flags(f) {}
+    void create(const char* /*t*/, func_t* p, ea_t s, ea_t e, int f) {
+        pfn = p; bounds_start = s; bounds_end = e; flags = f;
+    }
+    size_t size() const { return blocks.size(); }
+    const qbasic_block_t& operator[](size_t i) const { return blocks[i]; }
+    qbasic_block_t& operator[](size_t i) { return blocks[i]; }
+    int nsucc(int /*n*/) const { return 0; }
+    int npred(int /*n*/) const { return 0; }
+    int succ(int /*n*/, int /*i*/) const { return -1; }
+    int pred(int /*n*/, int /*i*/) const { return -1; }
+};
+
+// tool_result_t (agent tools return)
+struct tool_result_t {
+    bool ok = false;
+    std::string message;
+    std::string error;
+    std::string result_json;
+    std::string content;
+    bool is_error = false;
+};
+
+// Agent tools registry stub
+namespace agent_tools {
+    class ToolRegistry {
+    public:
+        static ToolRegistry& instance() { static ToolRegistry S; return S; }
+        template<typename... Args> void register_tool(Args&&...) {}
+        template<typename... Args> void register_tools(Args&&...) {}
+    };
+}
+
+// Extra segment/name helpers
+inline int get_max_strlit_length(ea_t /*ea*/, int32_t /*strtype*/, int /*flags*/ = 0) { return 0; }
+inline int get_strlit_contents(qstring* /*out*/, ea_t /*ea*/, size_t /*len*/, int32_t /*strtype*/ = 0) { return 0; }
+
+// Demangling
+inline int demangle_name(qstring* /*out*/, const char* /*mangled*/, uint32_t /*disable_mask*/ = 0) { return 0; }
+inline std::string demangle(const std::string& s) { return s; }
+
+// TWidget / open_custom_viewer
+struct TWidget;
+inline TWidget* find_widget(const char* /*caption*/) { return nullptr; }
+inline void activate_widget(TWidget* /*widget*/, bool /*take_focus*/ = true) {}
+inline void close_widget(TWidget* /*widget*/, int /*options*/ = 0) {}
+inline TWidget* open_custom_viewer(const char* /*title*/, void* /*strvec*/ = nullptr, int /*flags*/ = 0) { return nullptr; }
+inline void set_dock_pos(const char* /*src*/, const char* /*dst*/, int /*orient*/ = 0) {}
+
+inline void refresh_idaview_anyway() {}
+inline void refresh_choosers() {}
+inline void refresh_ui() {}
+
+// MSVC-only numeric aliases
+#ifndef _MSC_VER
+inline unsigned long long _strtoui64(const char* str, char** endptr, int base) {
+    return std::strtoull(str, endptr, base);
+}
+inline long long _strtoi64(const char* str, char** endptr, int base) {
+    return std::strtoll(str, endptr, base);
+}
+#endif
+
+// JSON sanitize helpers
+inline void sanitize_json_utf8_inplace(std::string& /*s*/) {}
+inline std::string sanitize_json_utf8(const std::string& s) { return s; }
+
+// udt structs
+struct udt_member_t {
+    qstring name;
+    tinfo_t type;
+    uint64_t offset = 0;
+    uint64_t size = 0;
+};
+struct udt_type_data_t : std::vector<udt_member_t> {
+    size_t total_size = 0;
+    bool is_union = false;
+};
+using udt = udt_type_data_t;

@@ -542,12 +542,12 @@ ea_t prev_head(ea_t ea, ea_t /*minea*/) {
 
 // -------- Imports / exports (subset) --------
 
-uint get_import_module_qty() {
+int get_import_module_qty() {
     auto* Db = State().Db;
     if (!Db) return 0;
     std::set<QString> Dlls;
     for (const auto& I : Db->GetBinaryInfo().Imports) Dlls.insert(I.DllName);
-    return static_cast<uint>(Dlls.size());
+    return static_cast<int>(Dlls.size());
 }
 
 bool get_import_module_name(qstring* out, int idx) {
@@ -806,29 +806,10 @@ cfuncptr_t decompile(ea_t ea, hexrays_failure_t* hf, int flags) {
     return decompile(get_func(ea), hf, flags);
 }
 
-// -------- nalt.hpp / entry.hpp deferred impls --------
-
-#include <fidra/ida-compat/nalt.hpp>
-#include <fidra/ida-compat/entry.hpp>
+// nalt.hpp / entry.hpp impls: get_imagebase et al. are defined earlier —
+// see the "Imports / exports (subset)" block above.
 
 ea_t get_imagebase() {
-    auto* Db = Fidra::IdaShim::CurrentDb();
+    auto* Db = ::Fidra::IdaShim::CurrentDb();
     return Db ? Db->GetBinaryInfo().ImageBase : 0;
-}
-
-int get_import_module_qty() {
-    auto* Db = Fidra::IdaShim::CurrentDb();
-    return Db ? Db->GetBinaryInfo().Imports.size() : 0;
-}
-
-size_t get_entry_qty() {
-    auto* Db = Fidra::IdaShim::CurrentDb();
-    return Db ? static_cast<size_t>(Db->GetBinaryInfo().Exports.size()) : 0;
-}
-
-uval_t get_entry_ordinal(size_t idx) {
-    auto* Db = Fidra::IdaShim::CurrentDb();
-    if (!Db) return 0;
-    const auto& E = Db->GetBinaryInfo().Exports;
-    return idx < static_cast<size_t>(E.size()) ? E[idx].Ordinal : 0;
 }

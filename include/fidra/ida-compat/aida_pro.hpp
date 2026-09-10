@@ -34,4 +34,4 @@ inline void aida_request_refresh(builtin_widgets_mask_t /*mask*/, bool /*dirty*/
 
 // mstr helper (IDA-ism)
 inline void aida_msg(const char* /*fmt*/, ...) {}
-#define msg(...) aida_msg(__VA_ARGS__)
+// msg(...) provided by kernwin.hpp — leave alone here to avoid macro clash.

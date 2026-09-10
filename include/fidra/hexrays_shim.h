@@ -74,6 +74,7 @@ struct citem_t {
 
 struct cexpr_t : citem_t {
     uint64_t n_value = 0;
+    ea_t obj_ea = BADADDR;
     std::string helper;
     std::string obj_name;
     std::vector<cexpr_t> args;
@@ -92,23 +93,28 @@ struct cexpr_t : citem_t {
     std::vector<uint64_t> values;
 };
 
-struct cswitch_t {
-    cexpr_t expr;
-    std::vector<cexpr_t> cases;
-    ea_t maxval = 0;
-    ea_t minval = 0;
-};
-
 struct cinsn_t : citem_t {
     cexpr_t* expr = nullptr;
     std::vector<cinsn_t> body;
-    cswitch_t* cswitch = nullptr;
-    cinsn_t* cif = nullptr;
-    cinsn_t* cwhile = nullptr;
-    cinsn_t* cfor = nullptr;
-    cinsn_t* cdo = nullptr;
-    cinsn_t* creturn = nullptr;
+    struct cif_t* cif = nullptr;
+    struct cfor_t* cfor = nullptr;
+    struct cwhile_t* cwhile = nullptr;
+    struct cdo_t* cdo = nullptr;
+    struct cswitch_t* cswitch = nullptr;
+    struct creturn_t* creturn = nullptr;
+    struct cgoto_t* cgoto = nullptr;
+    struct casm_t* casm = nullptr;
 };
+
+struct cif_t     : cinsn_t { cinsn_t ithen; cinsn_t ielse; };
+struct cfor_t    : cinsn_t { cexpr_t init; cexpr_t cond; cexpr_t step; };
+struct cwhile_t  : cinsn_t {};
+struct cdo_t     : cinsn_t {};
+struct ccase_t   : cinsn_t { std::vector<uint64_t> values; };
+struct cswitch_t : cinsn_t { cexpr_t* expr = nullptr; std::vector<ccase_t> cases; ea_t minval = 0; ea_t maxval = 0; };
+struct creturn_t : cinsn_t { cexpr_t* expr = nullptr; };
+struct cgoto_t   : cinsn_t { int label_num = -1; };
+struct casm_t    : cinsn_t { std::vector<ea_t> ea_list; };
 
 class cfunc_t {
 public:
@@ -172,3 +178,106 @@ enum hexrays_event_t {
 // libdecomp / hexrays init helpers (no-ops for now)
 inline bool init_hexrays_plugin(int /*flags*/ = 0) { return false; }
 inline void term_hexrays_plugin() {}
+
+// ---- Microcode (hex-rays low-level IR) stubs ----
+
+enum mopcode_t {
+    m_nop = 0, m_stx, m_ldx, m_ldc, m_mov, m_neg, m_lnot, m_bnot, m_xds, m_xdu,
+    m_low, m_high, m_add, m_sub, m_mul, m_udiv, m_sdiv, m_umod, m_smod, m_or,
+    m_and, m_xor, m_shl, m_shr, m_sar, m_cfadd, m_ofadd, m_cfshl, m_cfshr,
+    m_sets, m_seto, m_setp, m_setnz, m_setz, m_setae, m_setb, m_seta, m_setbe,
+    m_setg, m_setge, m_setl, m_setle, m_jcnd, m_jnz, m_jz, m_jae, m_jb, m_ja,
+    m_jbe, m_jg, m_jge, m_jl, m_jle, m_jtbl, m_ijmp, m_goto, m_call, m_icall,
+    m_ret, m_push, m_pop, m_und, m_ext, m_f2i, m_f2u, m_i2f, m_u2f, m_f2f,
+    m_fneg, m_fadd, m_fsub, m_fmul, m_fdiv,
+};
+
+enum mopt_t {
+    mop_z = 0, mop_r, mop_n, mop_str, mop_d, mop_S, mop_v, mop_b,
+    mop_f, mop_l, mop_a, mop_h, mop_c, mop_fn, mop_p, mop_sc,
+};
+
+struct mop_t {
+    mopt_t t = mop_z;
+    uint32_t size = 0;
+    uint64_t nnn = 0;
+    int r = 0;
+    ea_t g = BADADDR;    // global operand ea (mop_v)
+    ea_t v = BADADDR;    // stack var
+    void* fn = nullptr;  // function operand
+    bool is_reg() const { return t == mop_r; }
+    bool is_reg(int) const { return t == mop_r; }
+    bool is_const() const { return t == mop_n; }
+    bool is_glbaddr() const { return t == mop_v; }
+    uint64_t value() const { return nnn; }
+    bool operator==(const mop_t& o) const { return t == o.t && nnn == o.nnn && size == o.size; }
+};
+
+// Microcode helpers
+class mlist_t {
+public:
+    void clear() {}
+    bool empty() const { return true; }
+    size_t size() const { return 0; }
+    void add(const mop_t&) {}
+    bool has_common(const mlist_t&) const { return false; }
+};
+
+class mba_t;
+// decompile_func for microcode: keep only cfuncptr_t alias (line 169). mba_t*
+// form is unused — chain code paths that need microcode all sit behind
+// gen_microcode() below, which returns nullptr and short-circuits callers.
+
+struct minsn_t {
+    mopcode_t opcode = m_nop;
+    ea_t ea = BADADDR;
+    mop_t l;
+    mop_t r;
+    mop_t d;
+    struct minsn_t* next = nullptr;
+    struct minsn_t* prev = nullptr;
+};
+
+struct mblock_t {
+    int serial = 0;
+    ea_t start = BADADDR;
+    ea_t end = BADADDR;
+    minsn_t* head = nullptr;
+    minsn_t* tail = nullptr;
+    struct mblock_t* nextb = nullptr;
+    struct mblock_t* prevb = nullptr;
+};
+
+class mba_t {
+public:
+    ea_t entry_ea = BADADDR;
+    int qty = 0;
+    std::vector<mblock_t*> blocks;
+    mblock_t* get_mblock(int /*n*/) { return nullptr; }
+    bool build_graph() { return false; }
+    void term() {}
+};
+
+enum mba_maturity_t {
+    MMAT_ZERO = 0, MMAT_PREOPTIMIZED, MMAT_LOCOPT, MMAT_CALLS,
+    MMAT_GLBOPT1, MMAT_GLBOPT2, MMAT_GLBOPT3, MMAT_LVARS,
+};
+
+struct mba_ranges_t {
+    ea_t start = 0;
+    ea_t end = 0;
+};
+
+inline mba_t* gen_microcode(const mba_ranges_t& /*range*/, hexrays_failure_t* hf = nullptr,
+                            void* /*retlist*/ = nullptr, int /*decomp_flags*/ = 0,
+                            mba_maturity_t /*reqmat*/ = MMAT_ZERO) {
+    if (hf) { hf->code = -1; hf->desc = "Fidra: microcode shim - not implemented"; }
+    return nullptr;
+}
+
+// cif_t / cfor_t / cwhile_t etc are defined earlier as cinsn_t subclasses.
+
+// Type-info helper
+class til_t {};
+inline til_t* get_idati() { return nullptr; }
+

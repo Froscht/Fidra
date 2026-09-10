@@ -3,7 +3,6 @@
 #include <string>
 #include <filesystem>
 
-// IDA POSIX-style filesystem helpers.
 inline bool qisdir(const char* path) {
     if (!path) return false;
     std::error_code Ec;
