@@ -48,6 +48,11 @@ struct hexrays_failure_t {
     std::string str() const { return desc; }
 };
 
+// vd_failure_t — hexrays exception type
+struct vd_failure_t : public hexrays_failure_t {
+    std::string hf_desc() const { return desc; }
+};
+
 struct lvar_t {
     std::string name;
     std::string type;
@@ -76,12 +81,33 @@ struct cexpr_t : citem_t {
     cexpr_t* y = nullptr;
     cexpr_t* z = nullptr;
     int v_idx = -1;
+    int m = -1;         // member index (cot_memref/memptr)
+    int ptrsize = 0;    // pointer size (cot_memptr)
     std::string type_str;
+
+    bool is_call_object_of(const char* /*name*/) const { return false; }
+    bool is_call_object_of(citem_t* /*item*/) const { return false; }
+    bool is_call_object_of(const citem_t* /*item*/) const { return false; }
+    // Values array — cot_num / cswitch value list.
+    std::vector<uint64_t> values;
+};
+
+struct cswitch_t {
+    cexpr_t expr;
+    std::vector<cexpr_t> cases;
+    ea_t maxval = 0;
+    ea_t minval = 0;
 };
 
 struct cinsn_t : citem_t {
     cexpr_t* expr = nullptr;
     std::vector<cinsn_t> body;
+    cswitch_t* cswitch = nullptr;
+    cinsn_t* cif = nullptr;
+    cinsn_t* cwhile = nullptr;
+    cinsn_t* cfor = nullptr;
+    cinsn_t* cdo = nullptr;
+    cinsn_t* creturn = nullptr;
 };
 
 class cfunc_t {
@@ -90,27 +116,35 @@ public:
     lvars_t lvars;
     std::vector<std::string> warnings;
     std::string pseudocode;
+    strvec_t pseudocode_lines;
 
     lvars_t* get_lvars() { return &lvars; }
     const lvars_t* get_lvars() const { return &lvars; }
     const std::vector<std::string>& get_warnings() const { return warnings; }
     std::string print_func() const { return pseudocode; }
+    const strvec_t& get_pseudocode() const { return pseudocode_lines; }
 
     cinsn_t body;
 
     bool save_user_cmts() { return true; }
     bool set_user_cmt(ea_t /*ea*/, const char* /*cmt*/) { return true; }
+    void build_c_tree() {}
+    void refresh_func_ctext() {}
 };
+
 
 using cfuncptr_t = std::shared_ptr<cfunc_t>;
 
 class ctree_visitor_t {
 public:
     int flags = 0;
+    std::vector<citem_t*> parents;
     ctree_visitor_t(int f = 0) : flags(f) {}
     virtual ~ctree_visitor_t() = default;
     virtual int visit_expr(cexpr_t* /*expr*/) { return 0; }
     virtual int visit_insn(cinsn_t* /*insn*/) { return 0; }
+    citem_t* parent_expr() { return parents.empty() ? nullptr : parents.back(); }
+    citem_t* parent_item() { return parents.empty() ? nullptr : parents.back(); }
     int apply_to(citem_t* /*root*/, citem_t* /*parent*/ = nullptr) { return 0; }
     int apply_to_exprs(citem_t* /*root*/, citem_t* /*parent*/ = nullptr) { return 0; }
 };
@@ -120,11 +154,13 @@ public:
     ctree_parentee_t(int f = 0) : ctree_visitor_t(f | CV_PARENTS) {}
     std::vector<citem_t*> parents;
     citem_t* parent_expr() { return parents.empty() ? nullptr : parents.back(); }
+    citem_t* parent_item() { return parents.empty() ? nullptr : parents.back(); }
 };
 
 // Decompile entry — stubs return nullptr and set failure so callers degrade.
 cfuncptr_t decompile(func_t* pfn, hexrays_failure_t* hf = nullptr, int flags = 0);
 cfuncptr_t decompile(ea_t ea, hexrays_failure_t* hf = nullptr, int flags = 0);
+inline cfuncptr_t decompile_func(func_t* pfn, hexrays_failure_t* hf = nullptr, int flags = 0) { return decompile(pfn, hf, flags); }
 
 // Hexrays hook events (subset — code compiles, runtime no-op)
 enum hexrays_event_t {
