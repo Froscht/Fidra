@@ -34,6 +34,8 @@ int McpModule::Priority() const {
 
 QWidget* McpModule::CreateMainWidget(QWidget* Parent) {
     Widget = new McpWidget(Parent);
+    if (Server) Widget->SetServer(Server);
+    if (ToolRegistry) Widget->SetToolRegistry(ToolRegistry);
     return Widget;
 }
 
