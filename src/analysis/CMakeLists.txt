@@ -6,12 +6,16 @@ set(ANALYSIS_SOURCES
     AnalysisEngine.cpp
     SignatureMatcher.h
     SignatureMatcher.cpp
+    IdaShim.cpp
 )
 
 add_library(fidra_analysis STATIC ${ANALYSIS_SOURCES})
 
-target_include_directories(fidra_analysis PRIVATE
+target_include_directories(fidra_analysis PUBLIC
     ${FIDRA_INCLUDE_DIR}
+)
+
+target_include_directories(fidra_analysis PRIVATE
     ${CMAKE_SOURCE_DIR}/src
 )
 
