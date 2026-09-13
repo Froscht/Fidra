@@ -59,6 +59,17 @@ bool McpServer::StartTcp(uint16_t Port) {
     return true;
 }
 
+bool McpServer::StartTcpAuto(uint16_t StartPort, int MaxAttempts) {
+    if (TcpServerInstance && TcpServerInstance->isListening()) return true;
+    for (int I = 0; I < MaxAttempts; ++I) {
+        uint16_t P = static_cast<uint16_t>(StartPort + I);
+        if (StartTcp(P)) return true;
+    }
+    emit LogMessage(QStringLiteral("MCP TCP: no free port in range %1..%2")
+                    .arg(StartPort).arg(StartPort + MaxAttempts - 1));
+    return false;
+}
+
 void McpServer::StopTcp() {
     if (!TcpServerInstance) return;
 
