@@ -93,6 +93,27 @@ AnalyzedInstruction AnalysisDatabase::GetInstruction(Address Addr) const {
     return Instructions->Get(Addr);
 }
 
+bool AnalysisDatabase::GetInstructionMeta(Address Addr, InstructionStore::InsnMeta& Out) const {
+    QReadLocker Locker(&InsnLock);
+    return Instructions->GetMeta(Addr, Out);
+}
+
+QList<InstructionStore::InsnMeta> AnalysisDatabase::GetInstructionsMeta(Address Start, Address End) const {
+    QReadLocker Locker(&InsnLock);
+    if (!InsnIndexBuilt) {
+        // Fallback: walk everything (rare — build index before calling).
+        QList<InstructionStore::InsnMeta> All;
+        Instructions->ForEach([&](const AnalyzedInstruction& I) {
+            if (I.Addr >= Start && I.Addr < End) {
+                InstructionStore::InsnMeta M;
+                if (Instructions->GetMeta(I.Addr, M)) All.append(M);
+            }
+        });
+        return All;
+    }
+    return Instructions->GetMetaRange(SortedInsnAddrs, Start, End);
+}
+
 bool AnalysisDatabase::HasInstruction(Address Addr) const {
     QReadLocker Locker(&InsnLock);
     return Instructions->Contains(Addr);

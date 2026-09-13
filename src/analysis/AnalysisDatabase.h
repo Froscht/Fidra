@@ -39,8 +39,12 @@ public:
 
     void AddInstruction(const AnalyzedInstruction& Inst);
     AnalyzedInstruction GetInstruction(Address Addr) const;
+    bool GetInstructionMeta(Address Addr, InstructionStore::InsnMeta& Out) const;
     bool HasInstruction(Address Addr) const;
     QList<AnalyzedInstruction> GetInstructions(Address Start, Address End) const;
+    // Range read of packed meta (no string preads). Requires
+    // BuildInstructionIndex() to have run.
+    QList<InstructionStore::InsnMeta> GetInstructionsMeta(Address Start, Address End) const;
     int InstructionCount() const;
     bool InstructionLimitReached() const;
     void ForEachInstruction(const std::function<void(const AnalyzedInstruction&)>& Callback) const;

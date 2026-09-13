@@ -1887,25 +1887,25 @@ void AnalysisWorker::ComputeFunctionBoundaryCFG(AnalyzedFunction& Func, const QS
     int InsnCount = 0;
     constexpr int MaxInsnPerFunc = 100000;
 
+    InstructionStore::InsnMeta Meta;
     while (!Worklist.isEmpty() && InsnCount < MaxInsnPerFunc) {
         Address Addr = Worklist.takeLast();
         if (Visited.contains(Addr)) continue;
         if (Addr != Func.Start && OtherFuncStarts.contains(Addr)) continue;
-        if (!Db->HasInstruction(Addr)) continue;
+        if (!Db->GetInstructionMeta(Addr, Meta)) continue;
 
-        AnalyzedInstruction Insn = Db->GetInstruction(Addr);
         Visited.insert(Addr);
         InsnCount++;
 
-        Address InsnEnd = Addr + Insn.Size;
+        Address InsnEnd = Addr + Meta.Size;
         if (InsnEnd > MaxEnd) MaxEnd = InsnEnd;
 
-        if (Insn.IsRet || Insn.IsHalt) continue;
+        if (Meta.IsRet || Meta.IsHalt) continue;
 
-        if (Insn.IsJump && !Insn.IsConditional) {
-            if (Insn.BranchTarget != 0 && !Visited.contains(Insn.BranchTarget)) {
-                if (!OtherFuncStarts.contains(Insn.BranchTarget) || Insn.BranchTarget == Func.Start) {
-                    Worklist.append(Insn.BranchTarget);
+        if (Meta.IsJump && !Meta.IsConditional) {
+            if (Meta.BranchTarget != 0 && !Visited.contains(Meta.BranchTarget)) {
+                if (!OtherFuncStarts.contains(Meta.BranchTarget) || Meta.BranchTarget == Func.Start) {
+                    Worklist.append(Meta.BranchTarget);
                 } else {
                     Func.HasTailCalls = true;
                 }
@@ -1913,13 +1913,13 @@ void AnalysisWorker::ComputeFunctionBoundaryCFG(AnalyzedFunction& Func, const QS
             continue;
         }
 
-        if (Insn.IsConditional) {
-            if (Insn.BranchTarget != 0 && !Visited.contains(Insn.BranchTarget)) {
-                Worklist.append(Insn.BranchTarget);
+        if (Meta.IsConditional) {
+            if (Meta.BranchTarget != 0 && !Visited.contains(Meta.BranchTarget)) {
+                Worklist.append(Meta.BranchTarget);
             }
         }
 
-        Address FallThrough = Addr + Insn.Size;
+        Address FallThrough = Addr + Meta.Size;
         if (!Visited.contains(FallThrough)) {
             Worklist.append(FallThrough);
         }
@@ -2238,8 +2238,10 @@ void AnalysisWorker::AnalyzeFunction(AnalyzedFunction& Func,
                                      const BinaryInfo& Info,
                                      bool Is64Bit,
                                      const QHash<Address, QList<Address>>& CallersByFunc) {
-    QList<AnalyzedInstruction> Insns = Db->GetInstructions(Func.Start, Func.End);
-    Func.InstructionCount = Insns.size();
+    // Meta-only pass: gets flags/BranchTarget/Size without paying two string
+    // preads per insn. Used for callee/CFG/dominance/loop passes.
+    QList<InstructionStore::InsnMeta> Metas = Db->GetInstructionsMeta(Func.Start, Func.End);
+    Func.InstructionCount = Metas.size();
 
     auto CIt = CallersByFunc.constFind(Func.Start);
     if (CIt != CallersByFunc.constEnd()) {
@@ -2247,16 +2249,16 @@ void AnalysisWorker::AnalyzeFunction(AnalyzedFunction& Func,
     }
 
     QSet<Address> CalleeSet;
-    for (const auto& Insn : Insns) {
-        if (Insn.IsCall && Insn.BranchTarget != 0) {
-            if (!CalleeSet.contains(Insn.BranchTarget)) {
-                CalleeSet.insert(Insn.BranchTarget);
-                Func.Callees.append(Insn.BranchTarget);
+    for (const auto& M : Metas) {
+        if (M.IsCall && M.BranchTarget != 0) {
+            if (!CalleeSet.contains(M.BranchTarget)) {
+                CalleeSet.insert(M.BranchTarget);
+                Func.Callees.append(M.BranchTarget);
             }
         }
     }
 
-    BuildBasicBlocks(Func, Insns);
+    BuildBasicBlocksMeta(Func, Metas);
     Func.BasicBlockCount = Func.Blocks.size();
 
     if (Func.Blocks.size() >= 2) {
@@ -2264,9 +2266,14 @@ void AnalysisWorker::AnalyzeFunction(AnalyzedFunction& Func,
         DetectLoops(Func);
     }
 
-    Func.StackFrameSize = ComputeStackFrameEquation(Insns, Func.Blocks);
-    Func.Convention = DetectCallingConvention(Insns, Is64Bit);
-    Func.ArgCount = DetectArgCount(Insns, Is64Bit, Func.Convention);
+    // CC / arg detection scan Mnemonic/Operands but only look at the first
+    // ~256 bytes of the function — small prefix, cheap to fetch with strings.
+    Address HeadEnd = std::min<Address>(Func.Start + 256, Func.End);
+    QList<AnalyzedInstruction> Head = Db->GetInstructions(Func.Start, HeadEnd);
+
+    Func.StackFrameSize = ComputeStackFrameEquation(Head, Func.Blocks);
+    Func.Convention = DetectCallingConvention(Head, Is64Bit);
+    Func.ArgCount = DetectArgCount(Head, Is64Bit, Func.Convention);
     (void)Info;
 }
 
@@ -2349,6 +2356,104 @@ void AnalysisWorker::BuildBasicBlocks(AnalyzedFunction& Func, const QList<Analyz
             }
         } else {
             Address FallAddr = LastInsn.Addr + LastInsn.Size;
+            if (FallAddr >= Func.Start && FallAddr < Func.End && BlockIndex.contains(FallAddr)) {
+                Block.Successors.append(FallAddr);
+            }
+        }
+
+        Func.Blocks.append(Block);
+    }
+
+    for (int I = 0; I < Func.Blocks.size(); ++I) {
+        Address BlockAddr = Func.Blocks[I].Start;
+        for (Address Succ : Func.Blocks[I].Successors) {
+            if (BlockIndex.contains(Succ)) {
+                int SuccIdx = BlockIndex[Succ];
+                if (SuccIdx < Func.Blocks.size()) {
+                    if (!Func.Blocks[SuccIdx].Predecessors.contains(BlockAddr)) {
+                        Func.Blocks[SuccIdx].Predecessors.append(BlockAddr);
+                    }
+                }
+            }
+        }
+    }
+}
+
+void AnalysisWorker::BuildBasicBlocksMeta(AnalyzedFunction& Func,
+                                          const QList<InstructionStore::InsnMeta>& Metas) {
+    Func.Blocks.clear();
+    if (Metas.isEmpty()) return;
+
+    QMap<Address, int> AddrToInsn;
+    for (int I = 0; I < Metas.size(); ++I) AddrToInsn[Metas[I].Addr] = I;
+
+    QSet<Address> BlockStarts;
+    BlockStarts.insert(Func.Start);
+
+    for (const auto& M : Metas) {
+        if (M.IsJump || M.IsConditional || M.IsCall) {
+            Address NextAddr = M.Addr + M.Size;
+            if (NextAddr >= Func.Start && NextAddr < Func.End && AddrToInsn.contains(NextAddr)) {
+                BlockStarts.insert(NextAddr);
+            }
+        }
+        if (M.IsJump || M.IsConditional) {
+            if (M.BranchTarget >= Func.Start && M.BranchTarget < Func.End) {
+                BlockStarts.insert(M.BranchTarget);
+            }
+        }
+    }
+
+    QList<Address> SortedStarts = BlockStarts.values();
+    std::sort(SortedStarts.begin(), SortedStarts.end());
+
+    QMap<Address, int> BlockIndex;
+    for (int I = 0; I < SortedStarts.size(); ++I) BlockIndex[SortedStarts[I]] = I;
+
+    for (int B = 0; B < SortedStarts.size(); ++B) {
+        BasicBlock Block;
+        Block.Start = SortedStarts[B];
+
+        Address BlockEnd = (B + 1 < SortedStarts.size()) ? SortedStarts[B + 1] : Func.End;
+
+        int InsnCount = 0;
+        InstructionStore::InsnMeta LastM{};
+        bool FoundLast = false;
+        auto StartIt = AddrToInsn.lowerBound(Block.Start);
+        auto EndIt = AddrToInsn.lowerBound(BlockEnd);
+        for (auto It = StartIt; It != EndIt; ++It) {
+            InsnCount++;
+            LastM = Metas[It.value()];
+            FoundLast = true;
+        }
+
+        if (!FoundLast) {
+            Block.End = Block.Start;
+            Block.InstructionCount = 0;
+            Func.Blocks.append(Block);
+            continue;
+        }
+
+        Block.End = LastM.Addr + LastM.Size;
+        Block.InstructionCount = InsnCount;
+
+        if (LastM.IsRet || LastM.IsHalt) {
+        } else if (LastM.IsJump && !LastM.IsConditional) {
+            if (LastM.BranchTarget >= Func.Start && LastM.BranchTarget < Func.End &&
+                BlockIndex.contains(LastM.BranchTarget)) {
+                Block.Successors.append(LastM.BranchTarget);
+            }
+        } else if (LastM.IsConditional) {
+            if (LastM.BranchTarget >= Func.Start && LastM.BranchTarget < Func.End &&
+                BlockIndex.contains(LastM.BranchTarget)) {
+                Block.Successors.append(LastM.BranchTarget);
+            }
+            Address FallAddr = LastM.Addr + LastM.Size;
+            if (FallAddr >= Func.Start && FallAddr < Func.End && BlockIndex.contains(FallAddr)) {
+                Block.Successors.append(FallAddr);
+            }
+        } else {
+            Address FallAddr = LastM.Addr + LastM.Size;
             if (FallAddr >= Func.Start && FallAddr < Func.End && BlockIndex.contains(FallAddr)) {
                 Block.Successors.append(FallAddr);
             }

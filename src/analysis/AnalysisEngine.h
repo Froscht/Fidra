@@ -48,6 +48,8 @@ private:
                          const BinaryInfo& Info,
                          bool Is64Bit,
                          const QHash<Address, QList<Address>>& CallersByFunc);
+    void BuildBasicBlocksMeta(AnalyzedFunction& Func,
+                              const QList<InstructionStore::InsnMeta>& Metas);
     void BuildBasicBlocks(AnalyzedFunction& Func, const QList<AnalyzedInstruction>& Insns);
     void ComputeDominance(AnalyzedFunction& Func);
     void DetectLoops(AnalyzedFunction& Func);

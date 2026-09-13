@@ -229,6 +229,52 @@ AnalyzedInstruction InstructionStore::Get(Address Addr) const {
     return Unpack(P);
 }
 
+void InstructionStore::MetaFromPacked(const PackedInsn& P, InsnMeta& Out) const {
+    Out.Addr            = P.Addr;
+    Out.BranchTarget    = P.BranchTarget;
+    Out.MemoryRef       = P.MemoryRef;
+    Out.Size            = P.Size;
+    Out.IsCall          = (P.Flags & F1_Call)  != 0;
+    Out.IsJump          = (P.Flags & F1_Jump)  != 0;
+    Out.IsRet           = (P.Flags & F1_Ret)   != 0;
+    Out.IsConditional   = (P.Flags & F1_Cond)  != 0;
+    Out.IsNop           = (P.Flags & F1_Nop)   != 0;
+    Out.IsPush          = (P.Flags & F1_Push)  != 0;
+    Out.IsPop           = (P.Flags & F1_Pop)   != 0;
+    Out.IsIndirectJump  = (P.Flags & F1_IJump) != 0;
+    Out.IsIndirectCall  = (P.Flags2 & F2_ICall) != 0;
+    Out.IsHalt          = (P.Flags2 & F2_Halt)  != 0;
+}
+
+bool InstructionStore::GetMeta(Address Addr, InsnMeta& Out) const {
+    QMutexLocker Locker(&Lock);
+    auto It = AddrIndex.constFind(Addr);
+    if (It == AddrIndex.constEnd()) return false;
+    PackedInsn P;
+    if (!ReadRecord(It.value(), P)) return false;
+    MetaFromPacked(P, Out);
+    return true;
+}
+
+QList<InstructionStore::InsnMeta> InstructionStore::GetMetaRange(
+        const std::vector<Address>& SortedAddrs, Address Lo, Address Hi) const {
+    QList<InsnMeta> Out;
+    QMutexLocker Locker(&Lock);
+    auto ItLo = std::lower_bound(SortedAddrs.begin(), SortedAddrs.end(), Lo);
+    auto ItHi = std::lower_bound(ItLo, SortedAddrs.end(), Hi);
+    Out.reserve(static_cast<int>(std::distance(ItLo, ItHi)));
+    for (auto It = ItLo; It != ItHi; ++It) {
+        auto F = AddrIndex.constFind(*It);
+        if (F == AddrIndex.constEnd()) continue;
+        PackedInsn P;
+        if (!ReadRecord(F.value(), P)) continue;
+        InsnMeta M;
+        MetaFromPacked(P, M);
+        Out.append(M);
+    }
+    return Out;
+}
+
 void InstructionStore::ForEach(const std::function<void(const AnalyzedInstruction&)>& Callback) const {
     QMutexLocker Locker(&Lock);
     for (auto It = AddrIndex.constBegin(); It != AddrIndex.constEnd(); ++It) {

@@ -33,6 +33,22 @@ public:
     bool Add(const AnalyzedInstruction& Inst);
     bool Contains(Address Addr) const;
     AnalyzedInstruction Get(Address Addr) const;
+    // Fast metadata read: no operand/comment string pread. Only size, flags,
+    // BranchTarget, MemoryRef, IsCall/IsJump/... — enough for CFG walks and
+    // xref building without paying two extra syscalls per insn.
+    struct InsnMeta {
+        Address Addr;
+        Address BranchTarget;
+        Address MemoryRef;
+        uint8_t Size;
+        bool IsCall, IsJump, IsRet, IsConditional, IsNop, IsPush, IsPop,
+             IsIndirectJump, IsIndirectCall, IsHalt;
+    };
+    bool GetMeta(Address Addr, InsnMeta& Out) const;
+    // Range read of meta only (no string preads). For per-function CFG /
+    // dominance / loop analysis that never reads Mnemonic or Operands.
+    QList<InsnMeta> GetMetaRange(const std::vector<Address>& SortedAddrs,
+                                 Address Lo, Address Hi) const;
     int Count() const;
 
     // Iterates every instruction. Reconstructs AnalyzedInstruction per entry.
@@ -87,6 +103,7 @@ private:
 
     void Pack(const AnalyzedInstruction& In, PackedInsn& Out);
     AnalyzedInstruction Unpack(const PackedInsn& P) const;
+    void MetaFromPacked(const PackedInsn& P, InsnMeta& Out) const;
     bool ReadRecord(uint64_t Offset, PackedInsn& Out) const;
 
     mutable QRecursiveMutex Lock;
