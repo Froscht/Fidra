@@ -102,6 +102,12 @@ void AnalysisWorker::Run() {
     ScanCodePointers();
     if (Cancelled.loadRelaxed()) { emit Finished(false); return; }
 
+    // Build the instruction index BEFORE ResolveJumpTables — that pass calls
+    // Db->GetInstructions(range) per jump candidate, and without the sorted
+    // index it falls back to iterating every instruction (fine on 100k, deadly
+    // at 20 M × 100k candidates).
+    Db->BuildInstructionIndex();
+
     EmitProgress(AnalysisState::Disassembling, 36, "Resolving jump tables...");
     ResolveJumpTables();
     if (Cancelled.loadRelaxed()) { emit Finished(false); return; }
@@ -1145,6 +1151,7 @@ void AnalysisWorker::DisassembleFromMT(Address Start, size_t CsHandle) {
         }
 
         bool StopFlow = false;
+        static thread_local int LimitCheckCounter = 0;
 
         for (size_t I = 0; I < Count && !StopFlow; ++I) {
             Address InsnAddr = Insns[I].address;
@@ -1154,9 +1161,16 @@ void AnalysisWorker::DisassembleFromMT(Address Start, size_t CsHandle) {
                 if (VisitedMT.contains(InsnAddr)) { StopFlow = true; break; }
                 VisitedMT.insert(InsnAddr);
             }
-            if (Db->HasInstruction(InsnAddr)) { StopFlow = true; break; }
 
-            if (Db->InstructionLimitReached()) { StopFlow = true; break; }
+            // Only check the DB-wide instruction limit every 256 insns —
+            // per-insn read-lock on InsnLock was billions of atomic ops on
+            // large binaries. HasInstruction likewise: we already checked at
+            // the outer while() entry, and VisitedMT above catches within-pass
+            // dupes, so per-insn full-DB check is redundant here.
+            if (++LimitCheckCounter >= 256) {
+                LimitCheckCounter = 0;
+                if (Db->InstructionLimitReached()) { StopFlow = true; break; }
+            }
 
             AnalyzedInstruction Ai;
             Ai.Addr = InsnAddr;
@@ -1747,9 +1761,19 @@ void AnalysisWorker::DisassembleFrom(Address Start) {
 void AnalysisWorker::FindFunctions() {
     BinaryInfo Info = Db->GetBinaryInfo();
 
+    // Snapshot known-function set and known-instruction set once. Prevents
+    // per-byte Db->HasFunction / Db->HasInstruction locks in the prologue-scan
+    // loop below (was ~200 M atomic ops on 300 MB PE files, the actual reason
+    // Fidra "never finishes" on huge binaries).
+    QSet<Address> KnownFuncs;
+    {
+        QList<AnalyzedFunction> Fs = Db->GetAllFunctions();
+        for (const auto& F : Fs) KnownFuncs.insert(F.Start);
+    }
+
     for (Address Addr : FunctionStarts) {
         if (Cancelled.loadRelaxed()) return;
-        if (Db->HasFunction(Addr)) continue;
+        if (KnownFuncs.contains(Addr)) continue;
         if (!Db->HasInstruction(Addr)) continue;
 
         AnalyzedFunction Func;
@@ -1766,6 +1790,7 @@ void AnalysisWorker::FindFunctions() {
         Func.IsThunk = false;
 
         Db->AddFunction(Func);
+        KnownFuncs.insert(Addr);
     }
 
     for (const Segment& Seg : Info.Segments) {
@@ -1778,7 +1803,7 @@ void AnalysisWorker::FindFunctions() {
 
         for (size_t Off = 0; Off + 4 <= SSize; ++Off) {
             Address Addr = Seg.VirtualAddress + Off;
-            if (Db->HasFunction(Addr)) continue;
+            if (KnownFuncs.contains(Addr)) continue;
 
             bool FoundPrologue = false;
 
@@ -1830,6 +1855,7 @@ void AnalysisWorker::FindFunctions() {
                 Func.IsExported = false;
                 Func.IsThunk = false;
                 Db->AddFunction(Func);
+                KnownFuncs.insert(Addr);
             }
         }
     }
@@ -2906,7 +2932,10 @@ void AnalysisWorker::RunLinearSweep() {
         return;
     }
 
-    constexpr int MaxLinearSweepTargets = 200000;
+    // 200k was way too generous for huge PE files — most extra targets past
+    // ~50k are false-positive prologues. Cap tight; recursive descent already
+    // caught the real ones from calls/exports/vtables.
+    constexpr int MaxLinearSweepTargets = 50000;
     if (ProloguesFound > MaxLinearSweepTargets) {
         emit LogMessage(QString("Linear sweep: capping from %1 to %2 targets").arg(ProloguesFound).arg(MaxLinearSweepTargets));
         NewTargets.resize(MaxLinearSweepTargets);
@@ -3469,6 +3498,24 @@ void AnalysisWorker::ResolveJumpTables() {
     int PtrSize = Info.Is64Bit ? 8 : 4;
     int JumpTableEntries = 0;
 
+    // Local lockless read against the BinaryInfo segment snapshot. The
+    // 4096-entry inner loop calling Db->ReadBytes was doing 400 M+ locked
+    // segment lookups on huge binaries — was the actual "hangs at 30%" cause.
+    auto LocalReadPtr = [&](Address Addr) -> uint64_t {
+        for (const Segment& Seg : Info.Segments) {
+            if (Addr < Seg.VirtualAddress) continue;
+            uint64_t Off = Addr - Seg.VirtualAddress;
+            if (Off + static_cast<uint64_t>(PtrSize) > static_cast<uint64_t>(Seg.Data.size())) continue;
+            const uint8_t* P = reinterpret_cast<const uint8_t*>(Seg.Data.constData()) + Off;
+            if (PtrSize == 8) {
+                uint64_t V; std::memcpy(&V, P, 8); return V;
+            } else {
+                uint32_t V; std::memcpy(&V, P, 4); return V;
+            }
+        }
+        return 0;
+    };
+
     auto IsCodeAddr = [&](uint64_t Addr) -> bool {
         for (const Segment& CodeSeg : Info.Segments) {
             if (CodeSeg.Type != SegmentType::Code && !CodeSeg.IsExecutable) continue;
@@ -3480,12 +3527,11 @@ void AnalysisWorker::ResolveJumpTables() {
     };
 
     auto AddTarget = [&](Address Target) {
-        if (!Db->HasInstruction(Target)) {
-            QMutexLocker Locker(&QueueMutex);
-            if (!VisitedMT.contains(Target) && !QueuedSetMT.contains(Target)) {
-                AddDisassemblyTargetMT(Target);
-                JumpTableEntries++;
-            }
+        if (Db->HasInstruction(Target)) return;
+        QMutexLocker Locker(&QueueMutex);
+        if (!VisitedMT.contains(Target) && !QueuedSetMT.contains(Target)) {
+            AddDisassemblyTargetMT(Target);
+            JumpTableEntries++;
         }
     };
 
@@ -3505,22 +3551,11 @@ void AnalysisWorker::ResolveJumpTables() {
     for (const auto& Cand : Candidates) {
         if (Cancelled.loadRelaxed()) return;
 
-        if (Cand.MemRef != 0 && Db->IsAddressValid(Cand.MemRef) && !Cand.IsIndirect) {
+        if (Cand.MemRef != 0 && !Cand.IsIndirect) {
             Address TableBase = Cand.MemRef;
             for (int EntryIdx = 0; EntryIdx < 4096; ++EntryIdx) {
                 Address EntryAddr = TableBase + EntryIdx * PtrSize;
-                QByteArray PtrBytes = Db->ReadBytes(EntryAddr, PtrSize);
-                if (PtrBytes.size() < PtrSize) break;
-
-                uint64_t Target = 0;
-                if (PtrSize == 8) {
-                    std::memcpy(&Target, PtrBytes.constData(), 8);
-                } else {
-                    uint32_t Val32 = 0;
-                    std::memcpy(&Val32, PtrBytes.constData(), 4);
-                    Target = Val32;
-                }
-
+                uint64_t Target = LocalReadPtr(EntryAddr);
                 if (Target == 0) break;
                 if (!IsCodeAddr(Target)) break;
                 AddTarget(static_cast<Address>(Target));
@@ -3566,17 +3601,23 @@ void AnalysisWorker::ResolveJumpTables() {
             }
         }
 
-        if (RelTableAddr != 0 && LeaBase != 0 && Db->IsAddressValid(RelTableAddr)) {
-            int MaxEntries = GuardTableSize > 0 ? GuardTableSize : 1024;
+        auto LocalReadU32 = [&](Address Addr) -> int32_t {
+            for (const Segment& Seg : Info.Segments) {
+                if (Addr < Seg.VirtualAddress) continue;
+                uint64_t Off = Addr - Seg.VirtualAddress;
+                if (Off + 4 > static_cast<uint64_t>(Seg.Data.size())) continue;
+                int32_t V;
+                std::memcpy(&V, Seg.Data.constData() + Off, 4);
+                return V;
+            }
+            return 0;
+        };
 
+        if (RelTableAddr != 0 && LeaBase != 0) {
+            int MaxEntries = GuardTableSize > 0 ? GuardTableSize : 1024;
             for (int EntryIdx = 0; EntryIdx < MaxEntries; ++EntryIdx) {
                 Address EntryAddr = RelTableAddr + EntryIdx * 4;
-                QByteArray OffBytes = Db->ReadBytes(EntryAddr, 4);
-                if (OffBytes.size() < 4) break;
-
-                int32_t RelOffset = 0;
-                std::memcpy(&RelOffset, OffBytes.constData(), 4);
-
+                int32_t RelOffset = LocalReadU32(EntryAddr);
                 uint64_t Target = LeaBase + RelOffset;
                 if (!IsCodeAddr(Target)) {
                     if (EntryIdx == 0) break;
@@ -3584,17 +3625,11 @@ void AnalysisWorker::ResolveJumpTables() {
                 }
                 AddTarget(static_cast<Address>(Target));
             }
-        } else if (RelTableAddr != 0 && LeaBase == 0 && Db->IsAddressValid(RelTableAddr)) {
-            AnalyzedFunction ContFunc = Db->GetFunctionContaining(Cand.Addr);
+        } else if (RelTableAddr != 0 && LeaBase == 0) {
             int MaxEntries = GuardTableSize > 0 ? GuardTableSize : 1024;
             for (int EntryIdx = 0; EntryIdx < MaxEntries; ++EntryIdx) {
                 Address EntryAddr = RelTableAddr + EntryIdx * 4;
-                QByteArray OffBytes = Db->ReadBytes(EntryAddr, 4);
-                if (OffBytes.size() < 4) break;
-
-                int32_t RelOffset = 0;
-                std::memcpy(&RelOffset, OffBytes.constData(), 4);
-
+                int32_t RelOffset = LocalReadU32(EntryAddr);
                 uint64_t Target = RelTableAddr + RelOffset;
                 if (!IsCodeAddr(Target)) {
                     Target = Cand.Addr + RelOffset;
