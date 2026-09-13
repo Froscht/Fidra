@@ -21,7 +21,7 @@ class AnalysisDatabase : public QObject {
     Q_OBJECT
 
 public:
-    static constexpr int MaxInstructions = 20000000;
+    static constexpr int MaxInstructions = 10000000;
 
     explicit AnalysisDatabase(QObject* Parent = nullptr);
     ~AnalysisDatabase() override;
