@@ -7,6 +7,8 @@ set(ANALYSIS_SOURCES
     SignatureMatcher.h
     SignatureMatcher.cpp
     IdaShim.cpp
+    InstructionStore.h
+    InstructionStore.cpp
 )
 
 add_library(fidra_analysis STATIC ${ANALYSIS_SOURCES})
