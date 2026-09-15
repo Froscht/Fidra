@@ -31,6 +31,9 @@ public:
     McpToolRegistry* GetToolRegistry() const;
 
     bool StartTcp(uint16_t Port = 3333);
+    // Auto-pick a free port starting at StartPort, incrementing up to MaxAttempts
+    // times. Lets multiple Fidra sessions run simultaneously without clashing.
+    bool StartTcpAuto(uint16_t StartPort = 3333, int MaxAttempts = 100);
     void StopTcp();
     bool IsTcpRunning() const;
     uint16_t TcpPort() const;

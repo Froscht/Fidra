@@ -1,6 +1,7 @@
 #pragma once
 
 #include "AnalysisTypes.h"
+#include "InstructionStore.h"
 #include <QObject>
 #include <QMap>
 #include <QMultiMap>
@@ -13,6 +14,7 @@
 #include <vector>
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <optional>
 
 namespace Fidra {
@@ -21,7 +23,11 @@ class AnalysisDatabase : public QObject {
     Q_OBJECT
 
 public:
-    static constexpr int MaxInstructions = 20000000;
+    // Peak RAM per insn is now the QHash<Address, uint64_t> entry (~24 bytes)
+    // plus the packed record on disk (56 bytes, backed by kernel page cache),
+    // so raise the cap. 40 M covers the largest known target (steam ~370 k
+    // funcs) with headroom.
+    static constexpr int MaxInstructions = 40000000;
 
     explicit AnalysisDatabase(QObject* Parent = nullptr);
     ~AnalysisDatabase() override;
@@ -33,8 +39,12 @@ public:
 
     void AddInstruction(const AnalyzedInstruction& Inst);
     AnalyzedInstruction GetInstruction(Address Addr) const;
+    bool GetInstructionMeta(Address Addr, InstructionStore::InsnMeta& Out) const;
     bool HasInstruction(Address Addr) const;
     QList<AnalyzedInstruction> GetInstructions(Address Start, Address End) const;
+    // Range read of packed meta (no string preads). Requires
+    // BuildInstructionIndex() to have run.
+    QList<InstructionStore::InsnMeta> GetInstructionsMeta(Address Start, Address End) const;
     int InstructionCount() const;
     bool InstructionLimitReached() const;
     void ForEachInstruction(const std::function<void(const AnalyzedInstruction&)>& Callback) const;
@@ -96,7 +106,7 @@ private:
     mutable QReadWriteLock InsnLock{QReadWriteLock::Recursive};
     bool LimitWarned = false;
     BinaryInfo Binary;
-    QHash<Address, AnalyzedInstruction> Instructions;
+    std::unique_ptr<InstructionStore> Instructions;
     QMap<Address, AnalyzedFunction> Functions;
     QMultiMap<Address, Xref> XrefsTo;
     QMultiMap<Address, Xref> XrefsFrom;

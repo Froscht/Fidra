@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(Fidra VERSION 1.0.0 LANGUAGES CXX)
+project(Fidra VERSION 1.0.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -60,6 +60,51 @@ FetchContent_MakeAvailable(LIEF)
 
 set(FIDRA_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/include)
 
+option(FIDRA_ENABLE_LIBDECOMP "Build libdecomp submodule as alternate decompiler backend" OFF)
+option(FIDRA_ENABLE_TRITON "Build Triton submodule for symbolic execution / vuln chains" OFF)
+option(FIDRA_ENABLE_UNICORN "Build Unicorn Engine submodule for emulation module" OFF)
+
+if(FIDRA_ENABLE_LIBDECOMP)
+    if(EXISTS ${CMAKE_SOURCE_DIR}/third_party/libdecomp/CMakeLists.txt)
+        # libdecomp's own CMakeLists uses ${CMAKE_SOURCE_DIR} internally which
+        # breaks when consumed as add_subdirectory. Build it ourselves.
+        file(GLOB_RECURSE _LIBDECOMP_SRC CONFIGURE_DEPENDS
+            ${CMAKE_SOURCE_DIR}/third_party/libdecomp/libdecomp/*.c)
+        add_library(libdecomp STATIC ${_LIBDECOMP_SRC})
+        target_include_directories(libdecomp PUBLIC
+            ${CMAKE_SOURCE_DIR}/third_party/libdecomp/include)
+        target_compile_definitions(libdecomp PRIVATE
+            LIBDECOMP_VERSION_MAJOR=0 LIBDECOMP_VERSION_MINOR=1
+            LIBDECOMP_ENABLE_BUILTIN_BACKEND_CAPSTONE=1)
+        target_link_libraries(libdecomp PUBLIC capstone)
+        target_compile_options(libdecomp PRIVATE -Wno-unused-parameter -Wno-unused-variable -Wno-unused-but-set-variable)
+    else()
+        message(FATAL_ERROR "FIDRA_ENABLE_LIBDECOMP set but third_party/libdecomp is empty. Run: git submodule update --init --recursive")
+    endif()
+endif()
+
+if(FIDRA_ENABLE_TRITON)
+    if(EXISTS ${CMAKE_SOURCE_DIR}/third_party/Triton/CMakeLists.txt)
+        set(TRITON_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(TRITON_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+        add_subdirectory(third_party/Triton EXCLUDE_FROM_ALL)
+    else()
+        message(FATAL_ERROR "FIDRA_ENABLE_TRITON set but third_party/Triton is empty. Run: git submodule update --init --recursive")
+    endif()
+endif()
+
+if(FIDRA_ENABLE_UNICORN)
+    if(EXISTS ${CMAKE_SOURCE_DIR}/third_party/unicorn/CMakeLists.txt)
+        set(UNICORN_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+        set(UNICORN_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(UNICORN_INSTALL OFF CACHE BOOL "" FORCE)
+        add_subdirectory(third_party/unicorn EXCLUDE_FROM_ALL)
+    else()
+        message(FATAL_ERROR "FIDRA_ENABLE_UNICORN set but third_party/unicorn is empty. Run: git submodule update --init --recursive")
+    endif()
+endif()
+
 add_subdirectory(src/core)
 add_subdirectory(src/disasm)
 add_subdirectory(src/debugger)
@@ -79,8 +124,16 @@ add_subdirectory(src/analysis)
 add_subdirectory(src/symbols)
 add_subdirectory(src/callgraph)
 add_subdirectory(src/scripting)
+add_subdirectory(src/graphrag)
+add_subdirectory(src/emulation)
+add_subdirectory(src/vuln)
 if(Qt6WebEngineWidgets_FOUND)
     add_subdirectory(src/browser)
+endif()
+
+option(FIDRA_BUILD_MULTIBINARY "Build multibinary index/project module (ported from AiDA)" ON)
+if(FIDRA_BUILD_MULTIBINARY)
+    add_subdirectory(src/multibinary)
 endif()
 
 option(FIDRA_BUILD_TESTS "Build the analysis test driver" OFF)

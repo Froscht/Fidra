@@ -102,6 +102,12 @@ void AnalysisWorker::Run() {
     ScanCodePointers();
     if (Cancelled.loadRelaxed()) { emit Finished(false); return; }
 
+    // Build the instruction index BEFORE ResolveJumpTables — that pass calls
+    // Db->GetInstructions(range) per jump candidate, and without the sorted
+    // index it falls back to iterating every instruction (fine on 100k, deadly
+    // at 20 M × 100k candidates).
+    Db->BuildInstructionIndex();
+
     EmitProgress(AnalysisState::Disassembling, 36, "Resolving jump tables...");
     ResolveJumpTables();
     if (Cancelled.loadRelaxed()) { emit Finished(false); return; }
@@ -1145,6 +1151,7 @@ void AnalysisWorker::DisassembleFromMT(Address Start, size_t CsHandle) {
         }
 
         bool StopFlow = false;
+        static thread_local int LimitCheckCounter = 0;
 
         for (size_t I = 0; I < Count && !StopFlow; ++I) {
             Address InsnAddr = Insns[I].address;
@@ -1154,9 +1161,16 @@ void AnalysisWorker::DisassembleFromMT(Address Start, size_t CsHandle) {
                 if (VisitedMT.contains(InsnAddr)) { StopFlow = true; break; }
                 VisitedMT.insert(InsnAddr);
             }
-            if (Db->HasInstruction(InsnAddr)) { StopFlow = true; break; }
 
-            if (Db->InstructionLimitReached()) { StopFlow = true; break; }
+            // Only check the DB-wide instruction limit every 256 insns —
+            // per-insn read-lock on InsnLock was billions of atomic ops on
+            // large binaries. HasInstruction likewise: we already checked at
+            // the outer while() entry, and VisitedMT above catches within-pass
+            // dupes, so per-insn full-DB check is redundant here.
+            if (++LimitCheckCounter >= 256) {
+                LimitCheckCounter = 0;
+                if (Db->InstructionLimitReached()) { StopFlow = true; break; }
+            }
 
             AnalyzedInstruction Ai;
             Ai.Addr = InsnAddr;
@@ -1747,9 +1761,19 @@ void AnalysisWorker::DisassembleFrom(Address Start) {
 void AnalysisWorker::FindFunctions() {
     BinaryInfo Info = Db->GetBinaryInfo();
 
+    // Snapshot known-function set and known-instruction set once. Prevents
+    // per-byte Db->HasFunction / Db->HasInstruction locks in the prologue-scan
+    // loop below (was ~200 M atomic ops on 300 MB PE files, the actual reason
+    // Fidra "never finishes" on huge binaries).
+    QSet<Address> KnownFuncs;
+    {
+        QList<AnalyzedFunction> Fs = Db->GetAllFunctions();
+        for (const auto& F : Fs) KnownFuncs.insert(F.Start);
+    }
+
     for (Address Addr : FunctionStarts) {
         if (Cancelled.loadRelaxed()) return;
-        if (Db->HasFunction(Addr)) continue;
+        if (KnownFuncs.contains(Addr)) continue;
         if (!Db->HasInstruction(Addr)) continue;
 
         AnalyzedFunction Func;
@@ -1766,6 +1790,7 @@ void AnalysisWorker::FindFunctions() {
         Func.IsThunk = false;
 
         Db->AddFunction(Func);
+        KnownFuncs.insert(Addr);
     }
 
     for (const Segment& Seg : Info.Segments) {
@@ -1778,7 +1803,7 @@ void AnalysisWorker::FindFunctions() {
 
         for (size_t Off = 0; Off + 4 <= SSize; ++Off) {
             Address Addr = Seg.VirtualAddress + Off;
-            if (Db->HasFunction(Addr)) continue;
+            if (KnownFuncs.contains(Addr)) continue;
 
             bool FoundPrologue = false;
 
@@ -1830,6 +1855,7 @@ void AnalysisWorker::FindFunctions() {
                 Func.IsExported = false;
                 Func.IsThunk = false;
                 Db->AddFunction(Func);
+                KnownFuncs.insert(Addr);
             }
         }
     }
@@ -1861,25 +1887,25 @@ void AnalysisWorker::ComputeFunctionBoundaryCFG(AnalyzedFunction& Func, const QS
     int InsnCount = 0;
     constexpr int MaxInsnPerFunc = 100000;
 
+    InstructionStore::InsnMeta Meta;
     while (!Worklist.isEmpty() && InsnCount < MaxInsnPerFunc) {
         Address Addr = Worklist.takeLast();
         if (Visited.contains(Addr)) continue;
         if (Addr != Func.Start && OtherFuncStarts.contains(Addr)) continue;
-        if (!Db->HasInstruction(Addr)) continue;
+        if (!Db->GetInstructionMeta(Addr, Meta)) continue;
 
-        AnalyzedInstruction Insn = Db->GetInstruction(Addr);
         Visited.insert(Addr);
         InsnCount++;
 
-        Address InsnEnd = Addr + Insn.Size;
+        Address InsnEnd = Addr + Meta.Size;
         if (InsnEnd > MaxEnd) MaxEnd = InsnEnd;
 
-        if (Insn.IsRet || Insn.IsHalt) continue;
+        if (Meta.IsRet || Meta.IsHalt) continue;
 
-        if (Insn.IsJump && !Insn.IsConditional) {
-            if (Insn.BranchTarget != 0 && !Visited.contains(Insn.BranchTarget)) {
-                if (!OtherFuncStarts.contains(Insn.BranchTarget) || Insn.BranchTarget == Func.Start) {
-                    Worklist.append(Insn.BranchTarget);
+        if (Meta.IsJump && !Meta.IsConditional) {
+            if (Meta.BranchTarget != 0 && !Visited.contains(Meta.BranchTarget)) {
+                if (!OtherFuncStarts.contains(Meta.BranchTarget) || Meta.BranchTarget == Func.Start) {
+                    Worklist.append(Meta.BranchTarget);
                 } else {
                     Func.HasTailCalls = true;
                 }
@@ -1887,13 +1913,13 @@ void AnalysisWorker::ComputeFunctionBoundaryCFG(AnalyzedFunction& Func, const QS
             continue;
         }
 
-        if (Insn.IsConditional) {
-            if (Insn.BranchTarget != 0 && !Visited.contains(Insn.BranchTarget)) {
-                Worklist.append(Insn.BranchTarget);
+        if (Meta.IsConditional) {
+            if (Meta.BranchTarget != 0 && !Visited.contains(Meta.BranchTarget)) {
+                Worklist.append(Meta.BranchTarget);
             }
         }
 
-        Address FallThrough = Addr + Insn.Size;
+        Address FallThrough = Addr + Meta.Size;
         if (!Visited.contains(FallThrough)) {
             Worklist.append(FallThrough);
         }
@@ -1924,12 +1950,21 @@ void AnalysisWorker::FindStrings() {
             const uint8_t* SData = reinterpret_cast<const uint8_t*>(Seg.Data.constData());
             size_t SSize = static_cast<size_t>(Seg.Data.size());
 
+            // Snapshot code-address set for this segment once. Kills per-byte
+            // Db->GetItemType() lock — on huge binaries that was O(seg_size)
+            // atomic ops per pass, per segment, per thread.
+            QSet<Address> CodeAddrs;
+            {
+                QList<AnalyzedInstruction> In = Db->GetInstructions(Seg.VirtualAddress, Seg.VirtualAddress + SSize);
+                for (const auto& I : In) CodeAddrs.insert(I.Addr);
+            }
+
             for (size_t Off = 0; Off < SSize; ) {
                 if (Cancelled.loadRelaxed()) return;
 
                 Address Addr = Seg.VirtualAddress + Off;
 
-                if (Db->GetItemType(Addr) == ItemType::Code) {
+                if (CodeAddrs.contains(Addr)) {
                     Off++;
                     continue;
                 }
@@ -2147,16 +2182,41 @@ void AnalysisWorker::AnalyzeFunctions() {
     int Total = AllFuncs.size();
     QAtomicInt Done(0);
 
+    // Snapshot BinaryInfo once — was called per-function inside AnalyzeFunction
+    // which copies the whole struct (all segments + imports + exports) every
+    // time under a read lock. On 300k+ functions that alone dominated the pass.
+    BinaryInfo InfoSnapshot = Db->GetBinaryInfo();
+    bool Is64BitSnapshot = InfoSnapshot.Is64Bit;
+
+    // Snapshot xrefs-to-any-function-start once. GetXrefsTo() per func was
+    // taking a read lock and building a QList each time.
+    QHash<Address, QList<Address>> CallersByFunc;
+    {
+        QSet<Address> FuncStartSet;
+        FuncStartSet.reserve(Total);
+        for (const auto& F : AllFuncs) FuncStartSet.insert(F.Start);
+        // Iterate xrefs once via the DB API: no bulk getter, so use per-func
+        // GetXrefsTo but only for CodeCall type. Fold into a hash.
+        for (Address S : FuncStartSet) {
+            if (Cancelled.loadRelaxed()) return;
+            QList<Xref> Xs = Db->GetXrefsTo(S);
+            QList<Address>& Bucket = CallersByFunc[S];
+            for (const auto& X : Xs) {
+                if (X.Type == XrefType::CodeCall) Bucket.append(X.From);
+            }
+        }
+    }
+
     int BatchSize = std::max(1, Total / (QThread::idealThreadCount() * 4));
     QList<QFuture<void>> Futures;
 
     for (int Start = 0; Start < Total; Start += BatchSize) {
         int End = std::min(Start + BatchSize, Total);
-        QFuture<void> Future = QtConcurrent::run([this, &AllFuncs, &Done, Total, Start, End]() {
+        QFuture<void> Future = QtConcurrent::run([this, &AllFuncs, &Done, &InfoSnapshot, Is64BitSnapshot, &CallersByFunc, Total, Start, End]() {
             QThread::currentThread()->setPriority(QThread::LowPriority);
             for (int I = Start; I < End; ++I) {
                 if (Cancelled.loadRelaxed()) return;
-                AnalyzeFunction(AllFuncs[I]);
+                AnalyzeFunction(AllFuncs[I], InfoSnapshot, Is64BitSnapshot, CallersByFunc);
                 Db->UpdateFunction(AllFuncs[I].Start, AllFuncs[I]);
                 int D = Done.fetchAndAddRelaxed(1) + 1;
                 if (D % 500 == 0) {
@@ -2174,28 +2234,31 @@ void AnalysisWorker::AnalyzeFunctions() {
     }
 }
 
-void AnalysisWorker::AnalyzeFunction(AnalyzedFunction& Func) {
-    BinaryInfo Info = Db->GetBinaryInfo();
+void AnalysisWorker::AnalyzeFunction(AnalyzedFunction& Func,
+                                     const BinaryInfo& Info,
+                                     bool Is64Bit,
+                                     const QHash<Address, QList<Address>>& CallersByFunc) {
+    // Meta-only pass: gets flags/BranchTarget/Size without paying two string
+    // preads per insn. Used for callee/CFG/dominance/loop passes.
+    QList<InstructionStore::InsnMeta> Metas = Db->GetInstructionsMeta(Func.Start, Func.End);
+    Func.InstructionCount = Metas.size();
 
-    QList<AnalyzedInstruction> Insns = Db->GetInstructions(Func.Start, Func.End);
-    Func.InstructionCount = Insns.size();
-
-    QList<Xref> XrefsTo = Db->GetXrefsTo(Func.Start);
-    for (const auto& Ref : XrefsTo) {
-        if (Ref.Type == XrefType::CodeCall) {
-            Func.Callers.append(Ref.From);
-        }
+    auto CIt = CallersByFunc.constFind(Func.Start);
+    if (CIt != CallersByFunc.constEnd()) {
+        Func.Callers = CIt.value();
     }
 
-    for (const auto& Insn : Insns) {
-        if (Insn.IsCall && Insn.BranchTarget != 0) {
-            if (!Func.Callees.contains(Insn.BranchTarget)) {
-                Func.Callees.append(Insn.BranchTarget);
+    QSet<Address> CalleeSet;
+    for (const auto& M : Metas) {
+        if (M.IsCall && M.BranchTarget != 0) {
+            if (!CalleeSet.contains(M.BranchTarget)) {
+                CalleeSet.insert(M.BranchTarget);
+                Func.Callees.append(M.BranchTarget);
             }
         }
     }
 
-    BuildBasicBlocks(Func, Insns);
+    BuildBasicBlocksMeta(Func, Metas);
     Func.BasicBlockCount = Func.Blocks.size();
 
     if (Func.Blocks.size() >= 2) {
@@ -2203,9 +2266,15 @@ void AnalysisWorker::AnalyzeFunction(AnalyzedFunction& Func) {
         DetectLoops(Func);
     }
 
-    Func.StackFrameSize = ComputeStackFrameEquation(Insns, Func.Blocks);
-    Func.Convention = DetectCallingConvention(Insns, Info.Is64Bit);
-    Func.ArgCount = DetectArgCount(Insns, Info.Is64Bit, Func.Convention);
+    // CC / arg detection scan Mnemonic/Operands but only look at the first
+    // ~256 bytes of the function — small prefix, cheap to fetch with strings.
+    Address HeadEnd = std::min<Address>(Func.Start + 256, Func.End);
+    QList<AnalyzedInstruction> Head = Db->GetInstructions(Func.Start, HeadEnd);
+
+    Func.StackFrameSize = ComputeStackFrameEquation(Head, Func.Blocks);
+    Func.Convention = DetectCallingConvention(Head, Is64Bit);
+    Func.ArgCount = DetectArgCount(Head, Is64Bit, Func.Convention);
+    (void)Info;
 }
 
 void AnalysisWorker::BuildBasicBlocks(AnalyzedFunction& Func, const QList<AnalyzedInstruction>& Insns) {
@@ -2287,6 +2356,104 @@ void AnalysisWorker::BuildBasicBlocks(AnalyzedFunction& Func, const QList<Analyz
             }
         } else {
             Address FallAddr = LastInsn.Addr + LastInsn.Size;
+            if (FallAddr >= Func.Start && FallAddr < Func.End && BlockIndex.contains(FallAddr)) {
+                Block.Successors.append(FallAddr);
+            }
+        }
+
+        Func.Blocks.append(Block);
+    }
+
+    for (int I = 0; I < Func.Blocks.size(); ++I) {
+        Address BlockAddr = Func.Blocks[I].Start;
+        for (Address Succ : Func.Blocks[I].Successors) {
+            if (BlockIndex.contains(Succ)) {
+                int SuccIdx = BlockIndex[Succ];
+                if (SuccIdx < Func.Blocks.size()) {
+                    if (!Func.Blocks[SuccIdx].Predecessors.contains(BlockAddr)) {
+                        Func.Blocks[SuccIdx].Predecessors.append(BlockAddr);
+                    }
+                }
+            }
+        }
+    }
+}
+
+void AnalysisWorker::BuildBasicBlocksMeta(AnalyzedFunction& Func,
+                                          const QList<InstructionStore::InsnMeta>& Metas) {
+    Func.Blocks.clear();
+    if (Metas.isEmpty()) return;
+
+    QMap<Address, int> AddrToInsn;
+    for (int I = 0; I < Metas.size(); ++I) AddrToInsn[Metas[I].Addr] = I;
+
+    QSet<Address> BlockStarts;
+    BlockStarts.insert(Func.Start);
+
+    for (const auto& M : Metas) {
+        if (M.IsJump || M.IsConditional || M.IsCall) {
+            Address NextAddr = M.Addr + M.Size;
+            if (NextAddr >= Func.Start && NextAddr < Func.End && AddrToInsn.contains(NextAddr)) {
+                BlockStarts.insert(NextAddr);
+            }
+        }
+        if (M.IsJump || M.IsConditional) {
+            if (M.BranchTarget >= Func.Start && M.BranchTarget < Func.End) {
+                BlockStarts.insert(M.BranchTarget);
+            }
+        }
+    }
+
+    QList<Address> SortedStarts = BlockStarts.values();
+    std::sort(SortedStarts.begin(), SortedStarts.end());
+
+    QMap<Address, int> BlockIndex;
+    for (int I = 0; I < SortedStarts.size(); ++I) BlockIndex[SortedStarts[I]] = I;
+
+    for (int B = 0; B < SortedStarts.size(); ++B) {
+        BasicBlock Block;
+        Block.Start = SortedStarts[B];
+
+        Address BlockEnd = (B + 1 < SortedStarts.size()) ? SortedStarts[B + 1] : Func.End;
+
+        int InsnCount = 0;
+        InstructionStore::InsnMeta LastM{};
+        bool FoundLast = false;
+        auto StartIt = AddrToInsn.lowerBound(Block.Start);
+        auto EndIt = AddrToInsn.lowerBound(BlockEnd);
+        for (auto It = StartIt; It != EndIt; ++It) {
+            InsnCount++;
+            LastM = Metas[It.value()];
+            FoundLast = true;
+        }
+
+        if (!FoundLast) {
+            Block.End = Block.Start;
+            Block.InstructionCount = 0;
+            Func.Blocks.append(Block);
+            continue;
+        }
+
+        Block.End = LastM.Addr + LastM.Size;
+        Block.InstructionCount = InsnCount;
+
+        if (LastM.IsRet || LastM.IsHalt) {
+        } else if (LastM.IsJump && !LastM.IsConditional) {
+            if (LastM.BranchTarget >= Func.Start && LastM.BranchTarget < Func.End &&
+                BlockIndex.contains(LastM.BranchTarget)) {
+                Block.Successors.append(LastM.BranchTarget);
+            }
+        } else if (LastM.IsConditional) {
+            if (LastM.BranchTarget >= Func.Start && LastM.BranchTarget < Func.End &&
+                BlockIndex.contains(LastM.BranchTarget)) {
+                Block.Successors.append(LastM.BranchTarget);
+            }
+            Address FallAddr = LastM.Addr + LastM.Size;
+            if (FallAddr >= Func.Start && FallAddr < Func.End && BlockIndex.contains(FallAddr)) {
+                Block.Successors.append(FallAddr);
+            }
+        } else {
+            Address FallAddr = LastM.Addr + LastM.Size;
             if (FallAddr >= Func.Start && FallAddr < Func.End && BlockIndex.contains(FallAddr)) {
                 Block.Successors.append(FallAddr);
             }
@@ -2715,14 +2882,24 @@ void AnalysisWorker::RunLinearSweep() {
         const uint8_t* SData = reinterpret_cast<const uint8_t*>(Seg.Data.constData());
         size_t SSize = static_cast<size_t>(Seg.Data.size());
 
+        // Snapshot known instruction addresses + sizes in this segment once.
+        // Avoids per-byte Db->HasInstruction() lock — for 100 MB segments the
+        // lock overhead alone was billions of atomic ops.
+        QHash<Address, uint8_t> KnownInsn;
+        {
+            QList<AnalyzedInstruction> In = Db->GetInstructions(Seg.VirtualAddress, Seg.VirtualAddress + SSize);
+            KnownInsn.reserve(In.size());
+            for (const auto& I : In) KnownInsn.insert(I.Addr, I.Size);
+        }
+
         for (size_t Off = 0; Off + 8 <= SSize; ) {
             if (Cancelled.loadRelaxed()) return;
 
             Address Addr = Seg.VirtualAddress + Off;
 
-            if (Db->HasInstruction(Addr)) {
-                auto Insn = Db->GetInstruction(Addr);
-                Off += Insn.Size > 0 ? Insn.Size : 1;
+            auto KIt = KnownInsn.constFind(Addr);
+            if (KIt != KnownInsn.constEnd()) {
+                Off += KIt.value() > 0 ? KIt.value() : 1;
                 continue;
             }
 
@@ -2860,7 +3037,10 @@ void AnalysisWorker::RunLinearSweep() {
         return;
     }
 
-    constexpr int MaxLinearSweepTargets = 200000;
+    // 200k was way too generous for huge PE files — most extra targets past
+    // ~50k are false-positive prologues. Cap tight; recursive descent already
+    // caught the real ones from calls/exports/vtables.
+    constexpr int MaxLinearSweepTargets = 50000;
     if (ProloguesFound > MaxLinearSweepTargets) {
         emit LogMessage(QString("Linear sweep: capping from %1 to %2 targets").arg(ProloguesFound).arg(MaxLinearSweepTargets));
         NewTargets.resize(MaxLinearSweepTargets);
@@ -3197,6 +3377,15 @@ void AnalysisWorker::FillCodeGaps() {
         if (cs_open(CsArch, CsMode, &Handle) != CS_ERR_OK) continue;
         cs_option(Handle, CS_OPT_DETAIL, CS_OPT_ON);
 
+        // Snapshot known-instruction table for this segment — same reason as
+        // RunLinearSweep (avoid per-byte lock).
+        QHash<Address, uint8_t> KnownGap;
+        {
+            QList<AnalyzedInstruction> In = Db->GetInstructions(Seg.VirtualAddress, Seg.VirtualAddress + SSize);
+            KnownGap.reserve(In.size());
+            for (const auto& I : In) KnownGap.insert(I.Addr, I.Size);
+        }
+
         size_t Off = 0;
         while (Off < SSize) {
             if (Cancelled.loadRelaxed()) break;
@@ -3204,9 +3393,9 @@ void AnalysisWorker::FillCodeGaps() {
 
             Address Addr = Seg.VirtualAddress + Off;
 
-            if (Db->HasInstruction(Addr)) {
-                auto Insn = Db->GetInstruction(Addr);
-                Off += Insn.Size > 0 ? Insn.Size : 1;
+            auto KIt = KnownGap.constFind(Addr);
+            if (KIt != KnownGap.constEnd()) {
+                Off += KIt.value() > 0 ? KIt.value() : 1;
                 continue;
             }
 
@@ -3231,7 +3420,7 @@ void AnalysisWorker::FillCodeGaps() {
 
             for (size_t I = 0; I < Count; ++I) {
                 Address InsnAddr = Insns[I].address;
-                if (Db->HasInstruction(InsnAddr)) break;
+                if (KnownGap.contains(InsnAddr)) break;
 
                 QString Mn = QString::fromUtf8(Insns[I].mnemonic).toLower();
 
@@ -3414,6 +3603,24 @@ void AnalysisWorker::ResolveJumpTables() {
     int PtrSize = Info.Is64Bit ? 8 : 4;
     int JumpTableEntries = 0;
 
+    // Local lockless read against the BinaryInfo segment snapshot. The
+    // 4096-entry inner loop calling Db->ReadBytes was doing 400 M+ locked
+    // segment lookups on huge binaries — was the actual "hangs at 30%" cause.
+    auto LocalReadPtr = [&](Address Addr) -> uint64_t {
+        for (const Segment& Seg : Info.Segments) {
+            if (Addr < Seg.VirtualAddress) continue;
+            uint64_t Off = Addr - Seg.VirtualAddress;
+            if (Off + static_cast<uint64_t>(PtrSize) > static_cast<uint64_t>(Seg.Data.size())) continue;
+            const uint8_t* P = reinterpret_cast<const uint8_t*>(Seg.Data.constData()) + Off;
+            if (PtrSize == 8) {
+                uint64_t V; std::memcpy(&V, P, 8); return V;
+            } else {
+                uint32_t V; std::memcpy(&V, P, 4); return V;
+            }
+        }
+        return 0;
+    };
+
     auto IsCodeAddr = [&](uint64_t Addr) -> bool {
         for (const Segment& CodeSeg : Info.Segments) {
             if (CodeSeg.Type != SegmentType::Code && !CodeSeg.IsExecutable) continue;
@@ -3425,12 +3632,11 @@ void AnalysisWorker::ResolveJumpTables() {
     };
 
     auto AddTarget = [&](Address Target) {
-        if (!Db->HasInstruction(Target)) {
-            QMutexLocker Locker(&QueueMutex);
-            if (!VisitedMT.contains(Target) && !QueuedSetMT.contains(Target)) {
-                AddDisassemblyTargetMT(Target);
-                JumpTableEntries++;
-            }
+        if (Db->HasInstruction(Target)) return;
+        QMutexLocker Locker(&QueueMutex);
+        if (!VisitedMT.contains(Target) && !QueuedSetMT.contains(Target)) {
+            AddDisassemblyTargetMT(Target);
+            JumpTableEntries++;
         }
     };
 
@@ -3450,22 +3656,11 @@ void AnalysisWorker::ResolveJumpTables() {
     for (const auto& Cand : Candidates) {
         if (Cancelled.loadRelaxed()) return;
 
-        if (Cand.MemRef != 0 && Db->IsAddressValid(Cand.MemRef) && !Cand.IsIndirect) {
+        if (Cand.MemRef != 0 && !Cand.IsIndirect) {
             Address TableBase = Cand.MemRef;
             for (int EntryIdx = 0; EntryIdx < 4096; ++EntryIdx) {
                 Address EntryAddr = TableBase + EntryIdx * PtrSize;
-                QByteArray PtrBytes = Db->ReadBytes(EntryAddr, PtrSize);
-                if (PtrBytes.size() < PtrSize) break;
-
-                uint64_t Target = 0;
-                if (PtrSize == 8) {
-                    std::memcpy(&Target, PtrBytes.constData(), 8);
-                } else {
-                    uint32_t Val32 = 0;
-                    std::memcpy(&Val32, PtrBytes.constData(), 4);
-                    Target = Val32;
-                }
-
+                uint64_t Target = LocalReadPtr(EntryAddr);
                 if (Target == 0) break;
                 if (!IsCodeAddr(Target)) break;
                 AddTarget(static_cast<Address>(Target));
@@ -3511,17 +3706,23 @@ void AnalysisWorker::ResolveJumpTables() {
             }
         }
 
-        if (RelTableAddr != 0 && LeaBase != 0 && Db->IsAddressValid(RelTableAddr)) {
-            int MaxEntries = GuardTableSize > 0 ? GuardTableSize : 1024;
+        auto LocalReadU32 = [&](Address Addr) -> int32_t {
+            for (const Segment& Seg : Info.Segments) {
+                if (Addr < Seg.VirtualAddress) continue;
+                uint64_t Off = Addr - Seg.VirtualAddress;
+                if (Off + 4 > static_cast<uint64_t>(Seg.Data.size())) continue;
+                int32_t V;
+                std::memcpy(&V, Seg.Data.constData() + Off, 4);
+                return V;
+            }
+            return 0;
+        };
 
+        if (RelTableAddr != 0 && LeaBase != 0) {
+            int MaxEntries = GuardTableSize > 0 ? GuardTableSize : 1024;
             for (int EntryIdx = 0; EntryIdx < MaxEntries; ++EntryIdx) {
                 Address EntryAddr = RelTableAddr + EntryIdx * 4;
-                QByteArray OffBytes = Db->ReadBytes(EntryAddr, 4);
-                if (OffBytes.size() < 4) break;
-
-                int32_t RelOffset = 0;
-                std::memcpy(&RelOffset, OffBytes.constData(), 4);
-
+                int32_t RelOffset = LocalReadU32(EntryAddr);
                 uint64_t Target = LeaBase + RelOffset;
                 if (!IsCodeAddr(Target)) {
                     if (EntryIdx == 0) break;
@@ -3529,17 +3730,11 @@ void AnalysisWorker::ResolveJumpTables() {
                 }
                 AddTarget(static_cast<Address>(Target));
             }
-        } else if (RelTableAddr != 0 && LeaBase == 0 && Db->IsAddressValid(RelTableAddr)) {
-            AnalyzedFunction ContFunc = Db->GetFunctionContaining(Cand.Addr);
+        } else if (RelTableAddr != 0 && LeaBase == 0) {
             int MaxEntries = GuardTableSize > 0 ? GuardTableSize : 1024;
             for (int EntryIdx = 0; EntryIdx < MaxEntries; ++EntryIdx) {
                 Address EntryAddr = RelTableAddr + EntryIdx * 4;
-                QByteArray OffBytes = Db->ReadBytes(EntryAddr, 4);
-                if (OffBytes.size() < 4) break;
-
-                int32_t RelOffset = 0;
-                std::memcpy(&RelOffset, OffBytes.constData(), 4);
-
+                int32_t RelOffset = LocalReadU32(EntryAddr);
                 uint64_t Target = RelTableAddr + RelOffset;
                 if (!IsCodeAddr(Target)) {
                     Target = Cand.Addr + RelOffset;

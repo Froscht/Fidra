@@ -2,6 +2,7 @@
 
 #include <fidra/ICore.h>
 #include <QMainWindow>
+#include <QMutex>
 #include <QTabWidget>
 #include <QDockWidget>
 #include <QStatusBar>
@@ -94,6 +95,9 @@ private:
     ProcessInfo AttachedProcess;
     bool ProcessAttached;
 
+    // Callback lists are appended to from module registration and iterated
+    // from the analysis / process threads. Serialise both ends.
+    mutable QMutex CallbackLock;
     QList<ProcessCallback> AttachCallbacks;
     QList<ProcessCallback> DetachCallbacks;
     QList<AddressCallback> FunctionNavCallbacks;

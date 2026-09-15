@@ -58,3 +58,4 @@ vgcore.*
 # executable, NOT the include/fidra/ source directory or a Fidra/ dir.
 /Fidra
 /fidra
+.claude/

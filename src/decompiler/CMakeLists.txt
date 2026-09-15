@@ -10,6 +10,9 @@ set(DECOMPILER_SOURCES
     DecompilerWidget.cpp
     DecompilerModule.h
     DecompilerModule.cpp
+    LibdecompBackend.h
+    LibdecompBackend.cpp
+    LibdecompGlue.c
 )
 
 add_library(fidra_decompiler STATIC ${DECOMPILER_SOURCES})
@@ -24,6 +27,12 @@ target_link_libraries(fidra_decompiler PRIVATE
     Qt6::Gui
     Qt6::Widgets
     capstone
+    fidra_analysis
 )
+
+if(FIDRA_ENABLE_LIBDECOMP AND TARGET libdecomp)
+    target_compile_definitions(fidra_decompiler PRIVATE FIDRA_HAS_LIBDECOMP=1)
+    target_link_libraries(fidra_decompiler PRIVATE libdecomp)
+endif()
 
 set_target_properties(fidra_decompiler PROPERTIES AUTOMOC ON)

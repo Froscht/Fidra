@@ -208,8 +208,13 @@ void Application::AttachToProcess(uint32_t Pid) {
         .arg(Pid)
         .arg(AttachedProcess.BaseAddress, 0, 16), LogLevel::Info);
 
-    for (auto& Callback : AttachCallbacks) {
-        Callback(Pid);
+    {
+        QList<ProcessCallback> Snapshot;
+        {
+            QMutexLocker Lock(&CallbackLock);
+            Snapshot = AttachCallbacks;
+        }
+        for (auto& Callback : Snapshot) Callback(Pid);
     }
 
     for (auto* Module : Modules) {
@@ -296,8 +301,13 @@ void Application::AttachToProcess(uint32_t Pid) {
         .arg(Pid)
         .arg(AttachedProcess.BaseAddress, 0, 16), LogLevel::Info);
 
-    for (auto& Callback : AttachCallbacks) {
-        Callback(Pid);
+    {
+        QList<ProcessCallback> Snapshot;
+        {
+            QMutexLocker Lock(&CallbackLock);
+            Snapshot = AttachCallbacks;
+        }
+        for (auto& Callback : Snapshot) Callback(Pid);
     }
 
     for (auto* Module : Modules) {
@@ -318,8 +328,13 @@ void Application::DetachFromProcess() {
         Module->OnProcessDetached();
     }
 
-    for (auto& Callback : DetachCallbacks) {
-        Callback(AttachedProcess.Pid);
+    {
+        QList<ProcessCallback> Snapshot;
+        {
+            QMutexLocker Lock(&CallbackLock);
+            Snapshot = DetachCallbacks;
+        }
+        for (auto& Callback : Snapshot) Callback(AttachedProcess.Pid);
     }
 
 #ifdef _WIN32
@@ -539,24 +554,31 @@ QList<ProcessInfo> Application::GetProcessList() {
 }
 
 void Application::OnProcessAttached(ProcessCallback Callback) {
+    QMutexLocker Lock(&CallbackLock);
     AttachCallbacks.append(std::move(Callback));
 }
 
 void Application::OnProcessDetached(ProcessCallback Callback) {
+    QMutexLocker Lock(&CallbackLock);
     DetachCallbacks.append(std::move(Callback));
 }
 
 void Application::NavigateToFunction(Address Addr) {
-    for (auto& Cb : FunctionNavCallbacks) {
-        Cb(Addr);
+    QList<AddressCallback> Snapshot;
+    {
+        QMutexLocker Lock(&CallbackLock);
+        Snapshot = FunctionNavCallbacks;
     }
+    for (auto& Cb : Snapshot) Cb(Addr);
 }
 
 void Application::OnFunctionNavigated(AddressCallback Callback) {
+    QMutexLocker Lock(&CallbackLock);
     FunctionNavCallbacks.append(std::move(Callback));
 }
 
 void Application::OnAnalysisStarted(AnalysisCallback Callback) {
+    QMutexLocker Lock(&CallbackLock);
     AnalysisStartCallbacks.append(std::move(Callback));
 }
 
@@ -917,8 +939,13 @@ void Application::OpenBinaryFile(const QString& FilePath) {
     AnalysisDatabase* Db = Engine->Database();
     ProgressPanel->SetDatabase(Db);
 
-    for (auto& Cb : AnalysisStartCallbacks) {
-        Cb(Db);
+    {
+        QList<AnalysisCallback> Snapshot;
+        {
+            QMutexLocker Lock(&CallbackLock);
+            Snapshot = AnalysisStartCallbacks;
+        }
+        for (auto& Cb : Snapshot) Cb(Db);
     }
 
     UpdateWindowTitle();

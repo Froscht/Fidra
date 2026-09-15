@@ -7,16 +7,16 @@
 namespace Fidra {
 
 AnalysisDatabase::AnalysisDatabase(QObject* Parent)
-    : QObject(Parent) {
+    : QObject(Parent), Instructions(std::make_unique<InstructionStore>()) {
+    Instructions->Open();
 }
 
-AnalysisDatabase::~AnalysisDatabase() {
-}
+AnalysisDatabase::~AnalysisDatabase() = default;
 
 void AnalysisDatabase::Clear() {
     {
         QWriteLocker Locker(&InsnLock);
-        Instructions.clear();
+        if (Instructions) Instructions->Clear();
         ItemTypes.clear();
         LimitWarned = false;
     }
@@ -78,28 +78,45 @@ BinaryInfo AnalysisDatabase::GetBinaryInfo() const {
 
 void AnalysisDatabase::AddInstruction(const AnalyzedInstruction& Inst) {
     QWriteLocker Locker(&InsnLock);
-    if (Instructions.size() >= MaxInstructions) {
+    if (Instructions->Count() >= MaxInstructions) {
         if (!LimitWarned) {
             LimitWarned = true;
             qWarning("AnalysisDatabase: instruction limit (%d) reached, dropping further instructions", MaxInstructions);
         }
         return;
     }
-    Instructions.insert(Inst.Addr, Inst);
+    Instructions->Add(Inst);
 }
 
 AnalyzedInstruction AnalysisDatabase::GetInstruction(Address Addr) const {
     QReadLocker Locker(&InsnLock);
-    auto It = Instructions.constFind(Addr);
-    if (It != Instructions.constEnd()) {
-        return It.value();
+    return Instructions->Get(Addr);
+}
+
+bool AnalysisDatabase::GetInstructionMeta(Address Addr, InstructionStore::InsnMeta& Out) const {
+    QReadLocker Locker(&InsnLock);
+    return Instructions->GetMeta(Addr, Out);
+}
+
+QList<InstructionStore::InsnMeta> AnalysisDatabase::GetInstructionsMeta(Address Start, Address End) const {
+    QReadLocker Locker(&InsnLock);
+    if (!InsnIndexBuilt) {
+        // Fallback: walk everything (rare — build index before calling).
+        QList<InstructionStore::InsnMeta> All;
+        Instructions->ForEach([&](const AnalyzedInstruction& I) {
+            if (I.Addr >= Start && I.Addr < End) {
+                InstructionStore::InsnMeta M;
+                if (Instructions->GetMeta(I.Addr, M)) All.append(M);
+            }
+        });
+        return All;
     }
-    return AnalyzedInstruction{};
+    return Instructions->GetMetaRange(SortedInsnAddrs, Start, End);
 }
 
 bool AnalysisDatabase::HasInstruction(Address Addr) const {
     QReadLocker Locker(&InsnLock);
-    return Instructions.contains(Addr);
+    return Instructions->Contains(Addr);
 }
 
 QList<AnalyzedInstruction> AnalysisDatabase::GetInstructions(Address Start, Address End) const {
@@ -108,21 +125,12 @@ QList<AnalyzedInstruction> AnalysisDatabase::GetInstructions(Address Start, Addr
     if (End <= Start) return Result;
 
     if (InsnIndexBuilt) {
-        auto Lo = std::lower_bound(SortedInsnAddrs.begin(), SortedInsnAddrs.end(), Start);
-        auto Hi = std::lower_bound(Lo, SortedInsnAddrs.end(), End);
-        Result.reserve(static_cast<int>(std::distance(Lo, Hi)));
-        for (auto It = Lo; It != Hi; ++It) {
-            auto Found = Instructions.constFind(*It);
-            if (Found != Instructions.constEnd()) {
-                Result.append(Found.value());
-            }
-        }
+        Instructions->ForEachInRange(SortedInsnAddrs, Start, End,
+            [&](const AnalyzedInstruction& I) { Result.append(I); });
     } else {
-        for (auto It = Instructions.constBegin(); It != Instructions.constEnd(); ++It) {
-            if (It.key() >= Start && It.key() < End) {
-                Result.append(It.value());
-            }
-        }
+        Instructions->ForEach([&](const AnalyzedInstruction& I) {
+            if (I.Addr >= Start && I.Addr < End) Result.append(I);
+        });
         std::sort(Result.begin(), Result.end(),
             [](const AnalyzedInstruction& A, const AnalyzedInstruction& B) { return A.Addr < B.Addr; });
     }
@@ -131,19 +139,17 @@ QList<AnalyzedInstruction> AnalysisDatabase::GetInstructions(Address Start, Addr
 
 int AnalysisDatabase::InstructionCount() const {
     QReadLocker Locker(&InsnLock);
-    return Instructions.size();
+    return Instructions->Count();
 }
 
 bool AnalysisDatabase::InstructionLimitReached() const {
     QReadLocker Locker(&InsnLock);
-    return Instructions.size() >= MaxInstructions;
+    return Instructions->Count() >= MaxInstructions;
 }
 
 void AnalysisDatabase::ForEachInstruction(const std::function<void(const AnalyzedInstruction&)>& Callback) const {
     QReadLocker Locker(&InsnLock);
-    for (auto It = Instructions.constBegin(); It != Instructions.constEnd(); ++It) {
-        Callback(It.value());
-    }
+    Instructions->ForEach(Callback);
 }
 
 void AnalysisDatabase::AddFunction(const AnalyzedFunction& Func) {
@@ -321,10 +327,8 @@ QMap<Address, QString> AnalysisDatabase::GetAllComments() const {
 void AnalysisDatabase::BuildInstructionIndex() {
     QWriteLocker Locker(&InsnLock);
     SortedInsnAddrs.clear();
-    SortedInsnAddrs.reserve(static_cast<size_t>(Instructions.size()));
-    for (auto It = Instructions.constBegin(); It != Instructions.constEnd(); ++It) {
-        SortedInsnAddrs.push_back(It.key());
-    }
+    SortedInsnAddrs.reserve(static_cast<size_t>(Instructions->Count()));
+    Instructions->ForEach([&](const AnalyzedInstruction& I) { SortedInsnAddrs.push_back(I.Addr); });
     std::sort(SortedInsnAddrs.begin(), SortedInsnAddrs.end());
     InsnIndexBuilt = true;
 }
@@ -453,7 +457,7 @@ QJsonObject AnalysisDatabase::ExportToJson() const {
     Root[QStringLiteral("exports")] = ExportArr;
 
     QJsonObject Stats;
-    Stats[QStringLiteral("instruction_count")] = Instructions.size();
+    Stats[QStringLiteral("instruction_count")] = Instructions->Count();
     Stats[QStringLiteral("function_count")] = Functions.size();
     Stats[QStringLiteral("string_count")] = Strings.size();
     Stats[QStringLiteral("xref_count")] = XrefsTo.size();
@@ -468,7 +472,7 @@ void AnalysisDatabase::ImportFromJson(const QJsonObject& Root) {
     QWriteLocker Locker(&Lock);
 
     Binary = BinaryInfo{};
-    Instructions.clear();
+    if (Instructions) Instructions->Clear();
     Functions.clear();
     XrefsTo.clear();
     XrefsFrom.clear();

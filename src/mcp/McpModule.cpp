@@ -34,6 +34,8 @@ int McpModule::Priority() const {
 
 QWidget* McpModule::CreateMainWidget(QWidget* Parent) {
     Widget = new McpWidget(Parent);
+    if (Server) Widget->SetServer(Server);
+    if (ToolRegistry) Widget->SetToolRegistry(ToolRegistry);
     return Widget;
 }
 
@@ -54,6 +56,14 @@ void McpModule::Initialize(ICore* Core) {
     connect(Server, &McpServer::LogMessage, this, [Core](const QString& Message) {
         Core->Log(Message, LogLevel::Info);
     });
+
+    // Auto-start the TCP server so external MCP clients can connect out of
+    // the box. Auto-picks a free port starting at 3333 — multiple Fidra
+    // sessions running in parallel each get their own endpoint.
+    if (!Server->StartTcpAuto(3333, 100)) {
+        Core->Log(QStringLiteral("MCP: auto-start failed, no free port in 3333..3432"),
+                  LogLevel::Warning);
+    }
 }
 
 void McpModule::Shutdown() {
