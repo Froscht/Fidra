@@ -37,10 +37,12 @@ target_link_libraries(fidra_multibinary PRIVATE
     capstone
 )
 
-target_compile_options(fidra_multibinary PRIVATE
-    -Wno-unused-parameter
-    -Wno-unused-variable
-    -Wno-unused-but-set-variable
-    -Wno-unused-function
-    -Wno-sign-compare
-)
+if(NOT MSVC)
+    target_compile_options(fidra_multibinary PRIVATE
+        -Wno-unused-parameter
+        -Wno-unused-variable
+        -Wno-unused-but-set-variable
+        -Wno-unused-function
+        -Wno-sign-compare
+    )
+endif()

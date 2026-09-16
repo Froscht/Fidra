@@ -15,6 +15,10 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <windows.h>
+#if !defined(_SSIZE_T_DEFINED)
+typedef SSIZE_T ssize_t;
+#define _SSIZE_T_DEFINED
+#endif
 static ssize_t safe_pread(int Fd, void* Buf, size_t Size, uint64_t Off) {
     HANDLE H = reinterpret_cast<HANDLE>(_get_osfhandle(Fd));
     OVERLAPPED O{}; O.Offset = static_cast<DWORD>(Off); O.OffsetHigh = static_cast<DWORD>(Off >> 32);

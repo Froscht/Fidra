@@ -2307,7 +2307,7 @@ void McpToolRegistry::RegisterAnalysisTools() {
                     if (CoreRef->ReadMemory(Base + DataRva, CvData, static_cast<size_t>(ReadLen))) {
                         uint32_t CvSig = *reinterpret_cast<uint32_t*>(CvData);
                         if (CvSig == 0x53445352) {
-                            Entry[QStringLiteral("pdb_path")] = QString::fromUtf8(reinterpret_cast<char*>(CvData + 24), ReadLen - 24).section('\0', 0, 0);
+                            Entry[QStringLiteral("pdb_path")] = QString::fromUtf8(reinterpret_cast<char*>(CvData + 24), ReadLen - 24).section(QChar(u'\0'), 0, 0);
                         }
                     }
                 }

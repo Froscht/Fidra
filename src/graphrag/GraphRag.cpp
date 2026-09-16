@@ -18,6 +18,12 @@
 #include <fidra/ida-compat/lines.hpp>
 #include <fidra/ida-compat/netnode.hpp>
 
+// POSIX mkdir(path, mode) -> Win32 _mkdir(path); the mode arg is ignored.
+#ifdef _WIN32
+#include <direct.h>
+#define mkdir(path, mode) _mkdir(path)
+#endif
+
 namespace graphrag
 {
 

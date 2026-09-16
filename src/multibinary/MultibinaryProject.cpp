@@ -537,8 +537,8 @@ std::string canonical_module_id_from_json(const json& module)
 
 std::string projects_root()
 {
-    const char* base = get_user_idadir();
-    return path_join(base != nullptr ? std::string(base) : std::string("."), "aida_projects");
+    qstring base = get_user_idadir();
+    return path_join(!base.empty() ? std::string(base.c_str()) : std::string("."), "aida_projects");
 }
 
 std::string project_root(const std::string& project_id)

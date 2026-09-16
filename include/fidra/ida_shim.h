@@ -21,6 +21,14 @@
 
 #include <fidra/Types.h>
 
+// ssize_t is a POSIX type; MSVC does not provide it. Back it with SSIZE_T.
+// The _SSIZE_T_DEFINED guard matches the CRT's own to avoid redefinition.
+#if defined(_MSC_VER) && !defined(_SSIZE_T_DEFINED)
+#include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
+#define _SSIZE_T_DEFINED
+#endif
+
 namespace Fidra {
 class AnalysisDatabase;
 class ICore;
