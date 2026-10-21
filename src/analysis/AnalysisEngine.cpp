@@ -1,5 +1,6 @@
 #include "AnalysisEngine.h"
 #include <capstone/capstone.h>
+#include "LibrarySignatures.h"
 #include <QFile>
 #include <QFileInfo>
 #include <QThread>
@@ -29,6 +30,87 @@ inline char* FidraCxaDemangle(const char* Mangled, char* OutputBuffer, size_t* L
 #include <QRegularExpression>
 
 namespace Fidra {
+
+// ELF imports: undefined .dynsym entries have st_value == 0, so they are
+// found through their relocations (GOT slot -> symbol) instead, and each PLT
+// stub is tied to the GOT slot its `jmp [rip+disp]` goes through.
+static void ResolveElfPltImports(BinaryInfo& Info) {
+    if (!Info.Is64Bit) return;
+    const Segment* DynSym = nullptr;
+    const Segment* DynStr = nullptr;
+    for (const Segment& Seg : Info.Segments) {
+        if (Seg.Name == ".dynsym") DynSym = &Seg;
+        else if (Seg.Name == ".dynstr") DynStr = &Seg;
+    }
+    if (!DynSym || !DynStr || DynSym->Data.isEmpty() || DynStr->Data.isEmpty()) return;
+
+    auto SymbolName = [&](uint64_t Index) -> QString {
+        const qsizetype Off = static_cast<qsizetype>(Index * 24);
+        if (Off + 24 > DynSym->Data.size()) return {};
+        uint32_t NameOff = 0;
+        std::memcpy(&NameOff, DynSym->Data.constData() + Off, 4);
+        if (NameOff >= static_cast<uint32_t>(DynStr->Data.size())) return {};
+        return QString::fromLatin1(DynStr->Data.constData() + NameOff);
+    };
+
+    QHash<Address, QString> GotToName;
+    for (const Segment& Seg : Info.Segments) {
+        if (Seg.Name != ".rela.plt" && Seg.Name != ".rela.dyn") continue;
+        const char* D = Seg.Data.constData();
+        for (qsizetype Off = 0; Off + 24 <= Seg.Data.size(); Off += 24) {
+            uint64_t ROffset = 0, RInfo = 0;
+            std::memcpy(&ROffset, D + Off, 8);
+            std::memcpy(&RInfo, D + Off + 8, 8);
+            const uint32_t Type = static_cast<uint32_t>(RInfo & 0xffffffff);
+            const uint64_t Sym = RInfo >> 32;
+            if (Sym == 0 || (Type != 6 && Type != 7)) continue;  // GLOB_DAT / JUMP_SLOT
+            QString Name = SymbolName(Sym);
+            if (!Name.isEmpty()) GotToName.insert(ROffset, Name);
+        }
+    }
+    if (GotToName.isEmpty()) return;
+
+    QHash<Address, Address> GotToStub;
+    for (const Segment& Seg : Info.Segments) {
+        const int EntrySize = (Seg.Name == ".plt.got") ? 8 : 16;
+        if (Seg.Name != ".plt" && Seg.Name != ".plt.sec" && Seg.Name != ".plt.got") continue;
+        const uint8_t* D = reinterpret_cast<const uint8_t*>(Seg.Data.constData());
+        const qsizetype N = Seg.Data.size();
+        for (qsizetype Off = 0; Off + 6 <= N; ++Off) {
+            if (D[Off] != 0xFF || D[Off + 1] != 0x25) continue;
+            int32_t Disp = 0;
+            std::memcpy(&Disp, D + Off + 2, 4);
+            const Address Target = Seg.VirtualAddress + Off + 6 + Disp;
+            if (!GotToName.contains(Target) || GotToStub.contains(Target)) continue;
+            GotToStub.insert(Target, Seg.VirtualAddress + (Off - Off % EntrySize));
+        }
+    }
+
+    QSet<QString> Known;
+    for (const ImportEntry& Imp : Info.Imports) Known.insert(Imp.FuncName);
+    for (auto It = GotToName.constBegin(); It != GotToName.constEnd(); ++It) {
+        if (Known.contains(It.value())) continue;
+        ImportEntry Imp;
+        Imp.FuncName = It.value();
+        Imp.Ordinal = 0;
+        Imp.IatAddress = It.key();
+        Imp.ThunkAddress = GotToStub.value(It.key(), 0);
+        Imp.IsBound = false;
+        Info.Imports.append(Imp);
+    }
+}
+
+// PLT entries are fixed-size; only the entry start is a function. The lazy
+// binding half ("push N; jmp .plt0") is reachable only through the GOT.
+static bool IsInsidePltEntry(const BinaryInfo& Info, Address Addr) {
+    for (const Segment& Seg : Info.Segments) {
+        if (Seg.Name != ".plt" && Seg.Name != ".plt.sec" && Seg.Name != ".plt.got") continue;
+        if (Addr < Seg.VirtualAddress || Addr >= Seg.VirtualAddress + Seg.VirtualSize) continue;
+        const Address EntrySize = (Seg.Name == ".plt.got") ? 8 : 16;
+        return (Addr - Seg.VirtualAddress) % EntrySize != 0;
+    }
+    return false;
+}
 
 static QString InternMnemonic(const char* Str) {
     thread_local QHash<QByteArray, QString> Cache;
@@ -82,6 +164,28 @@ void AnalysisWorker::Run() {
     EmitProgress(AnalysisState::Loading, 7, "Detecting packer/compiler...");
     DetectPackerCompiler();
     if (Cancelled.loadRelaxed()) { emit Finished(false); return; }
+
+    GoTable = ParseGoPclntab(Db->GetBinaryInfo());
+    if (GoTable.Found) {
+        BinaryInfo GoInfo = Db->GetBinaryInfo();
+        if (GoInfo.Compiler.isEmpty()) GoInfo.Compiler = QString("Go (pclntab %1)").arg(GoTable.Version);
+        Db->SetBinaryInfo(GoInfo);
+        emit LogMessage(QString("Go pclntab %1: %2 functions").arg(GoTable.Version).arg(GoTable.Functions.size()));
+    }
+
+    EmitProgress(AnalysisState::Loading, 8, "Loading debug info (DWARF/PDB)...");
+    Dwarf = LoadDebugInfo(Db->GetBinaryInfo());
+    if (Dwarf.Found) {
+        for (const DebugFunction& F : Dwarf.Functions) Db->SetDebugFunction(F);
+        emit LogMessage(QString("Debug info: %1 functions, %2 publics from %3 (%4 units)").arg(Dwarf.Functions.size()).arg(Dwarf.Publics.size()).arg(Dwarf.Path).arg(Dwarf.Units));
+    } else if (!Dwarf.Error.isEmpty() && !Dwarf.Error.startsWith("no ")) {
+        emit LogMessage("Debug info: " + Dwarf.Error);
+    }
+
+    EhFrame = ParseEhFrame(Db->GetBinaryInfo());
+    if (EhFrame.Found) {
+        emit LogMessage(QString(".eh_frame: %1 FDEs (%2 CIEs)").arg(EhFrame.Ranges.size()).arg(EhFrame.CieCount));
+    }
 
     int ThreadCount = QThread::idealThreadCount();
     if (ThreadCount < 2) ThreadCount = 2;
@@ -876,6 +980,8 @@ void AnalysisWorker::LoadElf(const QByteArray& Data) {
                 std::memcpy(&StShndx, Raw + SymOff + 6, 2);
                 uint64_t StValue = 0;
                 std::memcpy(&StValue, Raw + SymOff + 8, 8);
+                uint64_t StSize = 0;
+                std::memcpy(&StSize, Raw + SymOff + 16, 8);
 
                 uint8_t StBind = StInfo >> 4;
                 uint8_t StType = StInfo & 0xF;
@@ -888,6 +994,19 @@ void AnalysisWorker::LoadElf(const QByteArray& Data) {
                     SymName = QString::fromLatin1(SymStrTab.constData() + StName);
                 }
                 if (SymName.isEmpty()) continue;
+
+                if (StBind == 0 && StType == 2 && StShndx != 0) {
+                    ExportEntry Local;
+                    Local.Name = SymName;
+                    Local.Ordinal = 0;
+                    Local.Addr = StValue;
+                    Local.Rva = static_cast<uint32_t>(StValue - Info.ImageBase);
+                    Local.IsForwarder = false;
+                    Local.Size = static_cast<size_t>(StSize);
+                    Local.IsFunction = true;
+                    Info.LocalFunctions.append(Local);
+                    continue;
+                }
 
                 if (StBind == 1 || StBind == 2) {
                     if (StShndx == 0) {
@@ -906,6 +1025,8 @@ void AnalysisWorker::LoadElf(const QByteArray& Data) {
                         Exp.Addr = StValue;
                         Exp.Rva = static_cast<uint32_t>(StValue - Info.ImageBase);
                         Exp.IsForwarder = false;
+                        Exp.Size = static_cast<size_t>(StSize);
+                        Exp.IsFunction = StType == 2;
                         Info.Exports.append(Exp);
                     }
                 }
@@ -1014,6 +1135,8 @@ void AnalysisWorker::LoadElf(const QByteArray& Data) {
             }
         }
     }
+
+    ResolveElfPltImports(Info);
 
     emit LogMessage(QString("ELF loaded: %1 sections, %2 imports, %3 exports, entry=0x%4")
         .arg(Info.Segments.size())
@@ -1313,11 +1436,43 @@ void AnalysisWorker::RunRecursiveDescentMT() {
             AddDisassemblyTargetMT(Info.EntryPoint);
             FunctionStarts.insert(Info.EntryPoint);
         }
+        auto InExecutable = [&](Address Addr) {
+            for (const Segment& Seg : Info.Segments) {
+                if ((Seg.Type == SegmentType::Code || Seg.IsExecutable) &&
+                    Addr >= Seg.VirtualAddress && Addr < Seg.VirtualAddress + Seg.VirtualSize) return true;
+            }
+            return false;
+        };
         for (const auto& Exp : Info.Exports) {
-            if (Exp.Addr != 0 && !Exp.IsForwarder) {
+            // Data exports (typeinfo, vtables, globals) are not code.
+            if (Exp.Addr != 0 && !Exp.IsForwarder && InExecutable(Exp.Addr)) {
                 AddDisassemblyTargetMT(Exp.Addr);
                 FunctionStarts.insert(Exp.Addr);
             }
+        }
+        for (const auto& Local : Info.LocalFunctions) {
+            if (InExecutable(Local.Addr)) {
+                AddDisassemblyTargetMT(Local.Addr);
+                FunctionStarts.insert(Local.Addr);
+            }
+        }
+        for (const auto& GoFn : GoTable.Functions) {
+            AddDisassemblyTargetMT(GoFn.Entry);
+            FunctionStarts.insert(GoFn.Entry);
+        }
+        for (const auto& Fde : EhFrame.Ranges) {
+            AddDisassemblyTargetMT(Fde.Start);
+            FunctionStarts.insert(Fde.Start);
+        }
+        for (const DebugFunction& F : Dwarf.Functions) {
+            if (!InExecutable(F.Low)) continue;
+            AddDisassemblyTargetMT(F.Low);
+            FunctionStarts.insert(F.Low);
+        }
+        for (const auto& Pub : Dwarf.Publics) {
+            if (!InExecutable(Pub.first)) continue;
+            AddDisassemblyTargetMT(Pub.first);
+            FunctionStarts.insert(Pub.first);
         }
 
         int SectionSeeded = 0;
@@ -1394,7 +1549,9 @@ void AnalysisWorker::RunRecursiveDescentMT() {
             if (ThunkBytes.size() >= 6) {
                 uint8_t B0 = static_cast<uint8_t>(ThunkBytes[0]);
                 uint8_t B1 = static_cast<uint8_t>(ThunkBytes[1]);
-                if (B0 == 0xFF && B1 == 0x25) {
+                const bool EndBr = B0 == 0xF3 && B1 == 0x0F && static_cast<uint8_t>(ThunkBytes[2]) == 0x1E &&
+                                   static_cast<uint8_t>(ThunkBytes[3]) == 0xFA;  // .plt.sec stubs
+                if ((B0 == 0xFF && B1 == 0x25) || EndBr) {
                     AddDisassemblyTargetMT(Imp.ThunkAddress);
                     FunctionStarts.insert(Imp.ThunkAddress);
                     ThunkSeeded++;
@@ -1771,10 +1928,72 @@ void AnalysisWorker::FindFunctions() {
         for (const auto& F : Fs) KnownFuncs.insert(F.Start);
     }
 
+    // Inside Go code the pclntab is authoritative: other "starts" there are
+    // jump-table cases, code pointers or tail-call targets within a function.
+    QSet<Address> GoEntries;
+    Address GoBegin = 0, GoEnd = 0;
+    if (GoTable.Found) {
+        for (const auto& GoFn : GoTable.Functions) GoEntries.insert(GoFn.Entry);
+        GoBegin = GoTable.Functions.first().Entry;
+        GoEnd = GoTable.TextEnd;
+    }
+
+    // Sized function symbols give exact extents; anything starting strictly
+    // inside one is a jump-table case, code pointer or tail-call target.
+    QList<QPair<Address, Address>> SymRanges;
+    for (const ExportEntry& E : Info.Exports)
+        if (E.IsFunction && E.Size > 0) SymRanges.append({E.Addr, E.Addr + E.Size});
+    for (const ExportEntry& E : Info.LocalFunctions)
+        if (E.Size > 0) SymRanges.append({E.Addr, E.Addr + E.Size});
+    // .eh_frame FDEs are just as exact (one per function or .cold part).
+    for (const EhFrameRange& Fde : EhFrame.Ranges) SymRanges.append({Fde.Start, Fde.End});
+    for (const DebugFunction& F : Dwarf.Functions) SymRanges.append({F.Low, F.High});
+    std::sort(SymRanges.begin(), SymRanges.end());
+    QHash<Address, Address> SymbolEnd;
+    for (const auto& R : SymRanges) SymbolEnd.insert(R.first, std::max(SymbolEnd.value(R.first, 0), R.second));
+    // Running maximum of range ends so overlapping/nested symbols are handled.
+    QVector<Address> MaxEnd(SymRanges.size());
+    for (int I = 0; I < SymRanges.size(); ++I)
+        MaxEnd[I] = std::max(SymRanges[I].second, I > 0 ? MaxEnd[I - 1] : Address(0));
+    auto InsideSymbol = [&](Address Addr) {
+        auto It = std::upper_bound(SymRanges.begin(), SymRanges.end(), QPair<Address, Address>{Addr, ~Address(0)});
+        if (It == SymRanges.begin()) return false;
+        const int Idx = static_cast<int>(It - SymRanges.begin()) - 1;
+        for (int I = Idx; I >= 0 && MaxEnd[I] > Addr; --I) {
+            if (SymRanges[I].first < Addr && Addr < SymRanges[I].second) return true;
+            if (SymRanges[I].first == Addr) return false;
+        }
+        return false;
+    };
+
+    // Alignment padding between functions is not a function: move a start
+    // past nop/int3 to the first real instruction.
+    auto SkipPadding = [&](Address Addr) -> Address {
+        QList<AnalyzedInstruction> Head = Db->GetInstructions(Addr, Addr + 64);
+        Address Cur = Addr;
+        for (const AnalyzedInstruction& Insn : Head) {
+            if (Insn.Addr != Cur) break;
+            const bool Padding = Insn.Mnemonic == "nop" || Insn.Mnemonic == "int3" ||
+                                 (Insn.Mnemonic == "xchg" && Insn.Operands == "ax, ax");
+            if (!Padding) return Cur;
+            Cur += Insn.Size;
+        }
+        return Cur == Addr ? Addr : 0;  // padding all the way: no function here
+    };
+
+    QSet<Address> Starts;
     for (Address Addr : FunctionStarts) {
+        Address Real = SkipPadding(Addr);
+        if (Real != 0) Starts.insert(Real);
+    }
+
+    for (Address Addr : Starts) {
         if (Cancelled.loadRelaxed()) return;
         if (KnownFuncs.contains(Addr)) continue;
+        if (InsideSymbol(Addr)) continue;
         if (!Db->HasInstruction(Addr)) continue;
+        if (GoTable.Found && Addr >= GoBegin && Addr < GoEnd && !GoEntries.contains(Addr)) continue;
+        if (IsInsidePltEntry(Info, Addr)) continue;
 
         AnalyzedFunction Func;
         Func.Name = QString("sub_%1").arg(Addr, 0, 16);
@@ -1793,13 +2012,31 @@ void AnalysisWorker::FindFunctions() {
         KnownFuncs.insert(Addr);
     }
 
+    // A Go pclntab already lists every function exactly; byte patterns would
+    // only add false starts inside functions.
     for (const Segment& Seg : Info.Segments) {
+        if (GoTable.Found) break;
         if (Cancelled.loadRelaxed()) return;
         if (Seg.Type != SegmentType::Code) continue;
         if (Seg.Data.isEmpty()) continue;
 
         const uint8_t* SData = reinterpret_cast<const uint8_t*>(Seg.Data.constData());
         size_t SSize = static_cast<size_t>(Seg.Data.size());
+
+        // Prologue bytes like "sub rsp, imm" or "mov [rsp+x], rbx" also occur
+        // mid-function, so only accept a match that follows a hard boundary:
+        // padding, or a ret/jmp that does not fall through.
+        auto FollowsBoundary = [&](size_t Off) -> bool {
+            if (Off == 0) return true;
+            const uint8_t Prev = SData[Off - 1];
+            if (Prev == 0xCC || Prev == 0x90) return true;
+            const Address Addr = Seg.VirtualAddress + Off;
+            if (Prev == 0x00 && (Addr & 0xF) == 0) return true;  // tail of a multi-byte nop
+            if (Prev == 0xC3 && Db->HasInstruction(Addr - 1)) return true;
+            if (Off >= 2 && SData[Off - 2] == 0xEB && Db->HasInstruction(Addr - 2)) return true;
+            if (Off >= 5 && SData[Off - 5] == 0xE9 && Db->HasInstruction(Addr - 5)) return true;
+            return false;
+        };
 
         for (size_t Off = 0; Off + 4 <= SSize; ++Off) {
             Address Addr = Seg.VirtualAddress + Off;
@@ -1841,7 +2078,7 @@ void AnalysisWorker::FindFunctions() {
                 }
             }
 
-            if (FoundPrologue && Db->HasInstruction(Addr)) {
+            if (FoundPrologue && FollowsBoundary(Off) && !InsideSymbol(Addr) && Db->HasInstruction(Addr)) {
                 AnalyzedFunction Func;
                 Func.Name = QString("sub_%1").arg(Addr, 0, 16);
                 Func.Start = Addr;
@@ -1872,14 +2109,27 @@ void AnalysisWorker::FindFunctions() {
         if (Cancelled.loadRelaxed()) return;
 
         AnalyzedFunction Updated = AllFuncs[I];
-        ComputeFunctionBoundaryCFG(Updated, AllFuncStarts);
+        Address Limit = (I + 1 < AllFuncs.size()) ? AllFuncs[I + 1].Start : ~Address(0);
+        ComputeFunctionBoundaryCFG(Updated, AllFuncStarts, Limit);
+        // A sized symbol is authoritative: it also covers code the CFG walk
+        // cannot reach (exception landing pads in .cold parts) and excludes
+        // trailing padding after noreturn calls.
+        auto Sym = SymbolEnd.constFind(Updated.Start);
+        if (Sym != SymbolEnd.constEnd()) {
+            Updated.End = Sym.value();
+            Updated.Size = static_cast<size_t>(Updated.End - Updated.Start);
+        }
         Db->UpdateFunction(Updated.Start, Updated);
     }
 
     emit LogMessage(QString("Found %1 functions").arg(Db->FunctionCount()));
 }
 
-void AnalysisWorker::ComputeFunctionBoundaryCFG(AnalyzedFunction& Func, const QSet<Address>& OtherFuncStarts) {
+// Walks the function's control flow, staying inside [Func.Start, Limit) where
+// Limit is the next function's start. Jumps leaving that range are tail calls;
+// following them would swallow neighbouring functions (on Go binaries this
+// once merged most of .text into a single "function").
+void AnalysisWorker::ComputeFunctionBoundaryCFG(AnalyzedFunction& Func, const QSet<Address>& OtherFuncStarts, Address Limit) {
     QSet<Address> Visited;
     QList<Address> Worklist;
     Worklist.append(Func.Start);
@@ -1892,6 +2142,7 @@ void AnalysisWorker::ComputeFunctionBoundaryCFG(AnalyzedFunction& Func, const QS
         Address Addr = Worklist.takeLast();
         if (Visited.contains(Addr)) continue;
         if (Addr != Func.Start && OtherFuncStarts.contains(Addr)) continue;
+        if (Addr < Func.Start || Addr >= Limit) continue;
         if (!Db->GetInstructionMeta(Addr, Meta)) continue;
 
         Visited.insert(Addr);
@@ -1903,8 +2154,15 @@ void AnalysisWorker::ComputeFunctionBoundaryCFG(AnalyzedFunction& Func, const QS
         if (Meta.IsRet || Meta.IsHalt) continue;
 
         if (Meta.IsJump && !Meta.IsConditional) {
+            auto Table = JumpTableTargets.constFind(Addr);
+            if (Meta.BranchTarget == 0 && Table != JumpTableTargets.constEnd()) {
+                for (Address T : Table.value())
+                    if (T >= Func.Start && T < Limit && !Visited.contains(T)) Worklist.append(T);
+                continue;
+            }
             if (Meta.BranchTarget != 0 && !Visited.contains(Meta.BranchTarget)) {
-                if (!OtherFuncStarts.contains(Meta.BranchTarget) || Meta.BranchTarget == Func.Start) {
+                const bool InRange = Meta.BranchTarget >= Func.Start && Meta.BranchTarget < Limit;
+                if (InRange && (!OtherFuncStarts.contains(Meta.BranchTarget) || Meta.BranchTarget == Func.Start)) {
                     Worklist.append(Meta.BranchTarget);
                 } else {
                     Func.HasTailCalls = true;
@@ -1983,8 +2241,9 @@ void AnalysisWorker::FindStrings() {
                     continue;
                 }
 
+                // UTF-16 strings are 2-aligned; an odd start is ASCII read one byte off.
                 int WideLen = 0;
-                if (Off + 1 < SSize && IsWideString(SData + Off, SSize - Off, WideLen)) {
+                if ((Addr & 1) == 0 && Off + 1 < SSize && IsWideString(SData + Off, SSize - Off, WideLen)) {
                     AnalyzedString Str;
                     Str.Addr = Addr;
                     Str.Value = QString::fromUtf16(reinterpret_cast<const char16_t*>(SData + Off), WideLen);
@@ -2045,7 +2304,8 @@ bool AnalysisWorker::IsWideString(const uint8_t* Data, size_t MaxLen, int& OutLe
 
         if ((Wchar >= 0x20 && Wchar <= 0x7E) || Wchar == '\t' || Wchar == '\n' || Wchar == '\r') {
             OutLen++;
-        } else if (Wchar > 0x7E && Wchar < 0xD800) {
+        } else if (Wchar > 0x7E && Wchar < 0xD800 && (Wchar & 0xff) != 0) {
+            // 0xXX00 is a NUL followed by an ASCII byte, not text.
             OutLen++;
         } else {
             return false;
@@ -2152,6 +2412,15 @@ void AnalysisWorker::NameImportsExports() {
                 FullName = Imp.FuncName;
             }
             Db->SetName(Imp.IatAddress, FullName);
+            if (Imp.ThunkAddress != 0 && Imp.ThunkAddress != Imp.IatAddress) {
+                Db->SetName(Imp.ThunkAddress, FullName);
+                if (Db->HasFunction(Imp.ThunkAddress)) {
+                    AnalyzedFunction Func = Db->GetFunction(Imp.ThunkAddress);
+                    Func.Name = FullName;
+                    Func.IsThunk = true;
+                    Db->UpdateFunction(Imp.ThunkAddress, Func);
+                }
+            }
         }
     }
 
@@ -2167,7 +2436,47 @@ void AnalysisWorker::NameImportsExports() {
         }
     }
 
-    if (Info.EntryPoint != 0) {
+    for (const auto& Local : Info.LocalFunctions) {
+        if (Local.Name.isEmpty() || !Db->HasFunction(Local.Addr)) continue;
+        AnalyzedFunction Func = Db->GetFunction(Local.Addr);
+        if (!Func.Name.startsWith("sub_")) continue;
+        Db->SetName(Local.Addr, Local.Name);
+        Func.Name = Local.Name;
+        Db->UpdateFunction(Local.Addr, Func);
+    }
+
+    // DWARF names stripped binaries whose debug info lives in a separate file.
+    for (const DebugFunction& F : Dwarf.Functions) {
+        if (F.Name.isEmpty() || !Db->HasFunction(F.Low)) continue;
+        AnalyzedFunction Func = Db->GetFunction(F.Low);
+        if (!Func.Name.startsWith("sub_")) continue;
+        Db->SetName(F.Low, F.Name);
+        Func.Name = F.Name;
+        if (F.SourceName != F.Name) Func.DemangledName = F.SourceName;
+        Db->UpdateFunction(F.Low, Func);
+    }
+    // PDB public symbols (decorated names) cover code without module records.
+    for (const auto& Pub : Dwarf.Publics) {
+        if (Pub.second.isEmpty() || !Db->HasFunction(Pub.first)) continue;
+        AnalyzedFunction Func = Db->GetFunction(Pub.first);
+        if (!Func.Name.startsWith("sub_")) continue;
+        Db->SetName(Pub.first, Pub.second);
+        Func.Name = Pub.second;
+        Db->UpdateFunction(Pub.first, Func);
+    }
+
+    for (const auto& GoFn : GoTable.Functions) {
+        if (GoFn.Name.isEmpty()) continue;
+        Db->SetName(GoFn.Entry, GoFn.Name);
+        if (Db->HasFunction(GoFn.Entry)) {
+            AnalyzedFunction Func = Db->GetFunction(GoFn.Entry);
+            Func.Name = GoFn.Name;
+            Db->UpdateFunction(GoFn.Entry, Func);
+        }
+    }
+
+    // Go binaries keep their runtime name for the entry (e.g. _rt0_amd64_linux).
+    if (Info.EntryPoint != 0 && !GoTable.Found) {
         Db->SetName(Info.EntryPoint, "entry_point");
         if (Db->HasFunction(Info.EntryPoint)) {
             AnalyzedFunction Func = Db->GetFunction(Info.EntryPoint);
@@ -2391,7 +2700,7 @@ void AnalysisWorker::BuildBasicBlocksMeta(AnalyzedFunction& Func,
     BlockStarts.insert(Func.Start);
 
     for (const auto& M : Metas) {
-        if (M.IsJump || M.IsConditional || M.IsCall) {
+        if (M.IsJump || M.IsConditional || M.IsCall || M.IsRet || M.IsHalt) {
             Address NextAddr = M.Addr + M.Size;
             if (NextAddr >= Func.Start && NextAddr < Func.End && AddrToInsn.contains(NextAddr)) {
                 BlockStarts.insert(NextAddr);
@@ -2400,6 +2709,13 @@ void AnalysisWorker::BuildBasicBlocksMeta(AnalyzedFunction& Func,
         if (M.IsJump || M.IsConditional) {
             if (M.BranchTarget >= Func.Start && M.BranchTarget < Func.End) {
                 BlockStarts.insert(M.BranchTarget);
+            }
+        }
+        if (M.IsJump && !M.IsConditional && M.BranchTarget == 0) {
+            auto Table = JumpTableTargets.constFind(M.Addr);
+            if (Table != JumpTableTargets.constEnd()) {
+                for (Address T : Table.value())
+                    if (T >= Func.Start && T < Func.End && AddrToInsn.contains(T)) BlockStarts.insert(T);
             }
         }
     }
@@ -2442,6 +2758,13 @@ void AnalysisWorker::BuildBasicBlocksMeta(AnalyzedFunction& Func,
             if (LastM.BranchTarget >= Func.Start && LastM.BranchTarget < Func.End &&
                 BlockIndex.contains(LastM.BranchTarget)) {
                 Block.Successors.append(LastM.BranchTarget);
+            } else if (LastM.BranchTarget == 0) {
+                auto Table = JumpTableTargets.constFind(LastM.Addr);
+                if (Table != JumpTableTargets.constEnd()) {
+                    for (Address T : Table.value()) {
+                        if (BlockIndex.contains(T) && !Block.Successors.contains(T)) Block.Successors.append(T);
+                    }
+                }
             }
         } else if (LastM.IsConditional) {
             if (LastM.BranchTarget >= Func.Start && LastM.BranchTarget < Func.End &&
@@ -3631,7 +3954,9 @@ void AnalysisWorker::ResolveJumpTables() {
         return false;
     };
 
+    QVector<Address>* CurrentTable = nullptr;
     auto AddTarget = [&](Address Target) {
+        if (CurrentTable) CurrentTable->append(Target);
         if (Db->HasInstruction(Target)) return;
         QMutexLocker Locker(&QueueMutex);
         if (!VisitedMT.contains(Target) && !QueuedSetMT.contains(Target)) {
@@ -3656,6 +3981,8 @@ void AnalysisWorker::ResolveJumpTables() {
     for (const auto& Cand : Candidates) {
         if (Cancelled.loadRelaxed()) return;
 
+        CurrentTable = &JumpTableTargets[Cand.Addr];
+
         if (Cand.MemRef != 0 && !Cand.IsIndirect) {
             Address TableBase = Cand.MemRef;
             for (int EntryIdx = 0; EntryIdx < 4096; ++EntryIdx) {
@@ -3676,18 +4003,23 @@ void AnalysisWorker::ResolveJumpTables() {
         int GuardTableSize = 0;
         Address LeaBase = 0;
         Address RelTableAddr = 0;
+        // GCC/Clang PIC switch: lea rdx,[rip+T]; movsxd rax,[rdx+idx*4]; add rax,rdx; jmp rax
+        bool TableViaRegister = false;
+        static const QRegularExpression CmpImmRe(",\\s*(0x[0-9a-f]+|[0-9]+)\\s*$");
 
         for (int Back = Window.size() - 1; Back >= 0 && Back >= Window.size() - 12; --Back) {
             const auto& PrevInsn = Window[Back];
             QString PrevMn = PrevInsn.Mnemonic.toLower();
             QString PrevOp = PrevInsn.Operands.toLower();
 
-            if (GuardTableSize == 0 && (PrevMn == "cmp" || PrevMn == "test")) {
-                QRegularExpression CmpRe("(?:0x)?([0-9a-fA-F]+)");
-                auto CmpMatch = CmpRe.match(PrevOp);
+            if (GuardTableSize == 0 && PrevMn == "cmp") {
+                // Bound is the immediate operand ("cmp edi, 0x3e"); the old
+                // pattern matched hex-looking register names such as "ed".
+                auto CmpMatch = CmpImmRe.match(PrevOp);
                 if (CmpMatch.hasMatch()) {
-                    int Val = CmpMatch.captured(1).toInt(nullptr, 16);
-                    if (Val > 0 && Val <= 4096) {
+                    bool Ok = false;
+                    int Val = CmpMatch.captured(1).toInt(&Ok, 0);
+                    if (Ok && Val > 0 && Val <= 4096) {
                         GuardTableSize = Val + 1;
                     }
                 }
@@ -3702,8 +4034,15 @@ void AnalysisWorker::ResolveJumpTables() {
             if (PrevMn == "movsxd" || (PrevMn == "mov" && PrevOp.contains("dword"))) {
                 if (PrevInsn.MemoryRef != 0) {
                     RelTableAddr = PrevInsn.MemoryRef;
+                } else if (PrevOp.contains('[') && !PrevOp.contains("rip")) {
+                    TableViaRegister = true;
                 }
             }
+        }
+
+        if (RelTableAddr == 0 && TableViaRegister && LeaBase != 0) {
+            // Entries are relative to the table itself.
+            RelTableAddr = LeaBase;
         }
 
         auto LocalReadU32 = [&](Address Addr) -> int32_t {
@@ -3725,7 +4064,8 @@ void AnalysisWorker::ResolveJumpTables() {
                 int32_t RelOffset = LocalReadU32(EntryAddr);
                 uint64_t Target = LeaBase + RelOffset;
                 if (!IsCodeAddr(Target)) {
-                    if (EntryIdx == 0) break;
+                    // Without a bound the table ends at the first bad entry.
+                    if (EntryIdx == 0 || GuardTableSize == 0) break;
                     continue;
                 }
                 AddTarget(static_cast<Address>(Target));
@@ -3744,6 +4084,13 @@ void AnalysisWorker::ResolveJumpTables() {
             }
         }
     }
+
+    CurrentTable = nullptr;
+    for (auto It = JumpTableTargets.begin(); It != JumpTableTargets.end();) {
+        if (It.value().isEmpty()) It = JumpTableTargets.erase(It);
+        else ++It;
+    }
+    emit LogMessage(QString("Jump tables resolved: %1").arg(JumpTableTargets.size()));
 
     ResolveRelativeJumpTables(Info);
 
@@ -3860,6 +4207,9 @@ void AnalysisWorker::MatchSignatures() {
     for (const auto& Match : Matches) {
         if (Cancelled.loadRelaxed()) return;
 
+        // "common" signatures are code idioms (prologues, indirect calls,
+        // wrappers), not identifications; they must not rename functions.
+        if (Match.Module == "common") continue;
         if (Db->HasFunction(Match.Addr)) {
             AnalyzedFunction Func = Db->GetFunction(Match.Addr);
             if (Func.Name.startsWith("sub_")) {
@@ -3872,6 +4222,15 @@ void AnalysisWorker::MatchSignatures() {
     }
 
     emit LogMessage(QString("Signature matching: %1 matches, %2 applied").arg(Matches.size()).arg(Applied));
+
+    // Library signatures (.fsig): exact whole-function matches.
+    LibrarySignatures LibSigs;
+    QStringList SigFiles;
+    if (LibSigs.LoadDefaultDirectories(Info.Is64Bit, &SigFiles) > 0) {
+        const int Renamed = LibSigs.Apply(Db);
+        emit LogMessage(QString("Library signatures: %1 from %2 file(s), %3 functions identified")
+                            .arg(LibSigs.Count()).arg(SigFiles.size()).arg(Renamed));
+    }
 }
 
 void AnalysisWorker::DetectThunks() {

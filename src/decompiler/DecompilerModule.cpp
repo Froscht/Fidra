@@ -93,6 +93,9 @@ void DecompilerModule::Shutdown() {
 }
 
 void DecompilerModule::OnAnalysisComplete(AnalysisDatabase* Db, Address EntryPoint) {
+    // The shim's decompile()/get_func() (and so the Hexrays bridge above)
+    // read from the bound database; without this they always came back empty.
+    Fidra::IdaShim::Bind(Db, CoreRef);
     if (MainWidget) {
         MainWidget->SetDatabase(Db);
         if (EntryPoint != 0)

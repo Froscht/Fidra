@@ -803,6 +803,7 @@ namespace {
 namespace Fidra::HexraysShim {
     void SetDecompiler(DecompileCallback cb) { DecompilerCb() = std::move(cb); }
     bool HasDecompiler() { return static_cast<bool>(DecompilerCb()); }
+    std::string Decompile(ea_t Ea) { return HasDecompiler() ? DecompilerCb()(Ea) : std::string(); }
 }
 
 cfuncptr_t decompile(func_t* pfn, hexrays_failure_t* hf, int /*flags*/) {

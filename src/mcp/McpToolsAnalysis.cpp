@@ -6,6 +6,13 @@
 #include <algorithm>
 #include <QCryptographicHash>
 #include <QRegularExpression>
+#include <string>
+
+// From fidra_analysis (IdaShim.cpp); declared here to keep the IDA shim
+// headers out of this translation unit.
+namespace Fidra::HexraysShim {
+    std::string Decompile(uint64_t Ea);
+}
 
 namespace Fidra {
 
@@ -517,14 +524,24 @@ void McpToolRegistry::RegisterAnalysisTools() {
         });
 
     RegisterTool(QStringLiteral("decompile_function"),
-        QStringLiteral("Generate pseudocode from disassembled instructions at the given address."),
+        QStringLiteral("Decompile the function containing the given address to pseudo-C. Uses Fidra's decompiler on the "
+                       "analyzed binary; without an analysis it falls back to a per-instruction translation of live process memory."),
         Schema::Build({
             {QStringLiteral("address"), Schema::String(QStringLiteral("Function address in hex"))},
             {QStringLiteral("max_instructions"), Schema::Integer(QStringLiteral("Max instructions"), 1, 2000)}
         }, {QStringLiteral("address")}),
         [this](const QJsonObject& A) -> QJsonValue {
-            if (!CoreRef || !CoreRef->IsAttached()) return Schema::NotAttached();
             Address Addr = Schema::ParseHexAddress(A.value(QStringLiteral("address")).toString());
+            const std::string Decompiled = Fidra::HexraysShim::Decompile(Addr);
+            if (!Decompiled.empty()) {
+                QJsonObject Result;
+                Result[QStringLiteral("address")] = Schema::FormatAddress(Addr);
+                Result[QStringLiteral("pseudocode")] = QString::fromStdString(Decompiled);
+                Result[QStringLiteral("source")] = QStringLiteral("decompiler");
+                return Result;
+            }
+
+            if (!CoreRef || !CoreRef->IsAttached()) return Schema::NotAttached();
             int MaxInsns = A.value(QStringLiteral("max_instructions")).toInt(500);
 
             size_t ReadSize = static_cast<size_t>(MaxInsns) * 15;

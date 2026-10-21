@@ -2,6 +2,7 @@
 
 #include "AnalysisTypes.h"
 #include "InstructionStore.h"
+#include "DwarfInfo.h"
 #include <QObject>
 #include <QMap>
 #include <QMultiMap>
@@ -94,6 +95,11 @@ public:
     QJsonObject ExportToJson() const;
     void ImportFromJson(const QJsonObject& Root);
 
+    // Debug info (DWARF) per function entry: prototype and stack locals.
+    void SetDebugFunction(const DebugFunction& Func);
+    std::optional<DebugFunction> GetDebugFunction(Address Start) const;
+    int DebugFunctionCount() const;
+
 signals:
     void FunctionAdded(Address Addr, const QString& Name);
     void StringFound(Address Addr, const QString& Value);
@@ -114,6 +120,7 @@ private:
     QHash<Address, ItemType> ItemTypes;
     QMap<Address, QString> Names;
     QMap<Address, QString> Comments;
+    QHash<Address, DebugFunction> DebugFunctions;
 
     struct SegmentRange {
         Address Start;

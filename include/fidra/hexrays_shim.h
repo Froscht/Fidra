@@ -20,6 +20,9 @@ namespace Fidra::HexraysShim {
     using DecompileCallback = std::function<std::string(ea_t)>;
     void SetDecompiler(DecompileCallback cb);
     bool HasDecompiler();
+    // Pseudocode for the function containing Ea; empty without a bound
+    // database (IdaShim::Bind) or decompiler.
+    std::string Decompile(ea_t Ea);
 }
 
 // Hexrays ctree item type ids (subset — only referenced values enumerated)

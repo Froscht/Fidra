@@ -10,6 +10,9 @@ public:
     Optimizer();
 
     IrFunction Optimize(const IrFunction& Func);
+    // Register parameters of a freshly lifted function (argument registers
+    // read before being written), as RunParameterRecovery counts them.
+    static int RegisterParameterCount(const IrFunction& Func);
 
     void SetPassEnabled(const QString& PassName, bool Enabled);
     bool IsPassEnabled(const QString& PassName) const;
@@ -26,9 +29,8 @@ private:
     void RunPrologueEpilogueCleanup(IrFunction& Func);
     void RunConstantPropagation(IrFunction& Func);
     void RunTypeRecovery(IrFunction& Func);
+    void RunParameterRecovery(IrFunction& Func);
 
-    bool IsDefUsed(const IrOperand& Def, const IrBasicBlock& Block, int DefIdx);
-    bool IsDefUsedInAnyBlock(const IrOperand& Def, const IrFunction& Func, int DefBlock, int DefIdx);
     bool OperandMatches(const IrOperand& A, const IrOperand& B);
 
     QMap<QString, bool> EnabledPasses;

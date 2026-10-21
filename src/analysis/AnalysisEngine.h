@@ -3,6 +3,8 @@
 #include "AnalysisTypes.h"
 #include "AnalysisDatabase.h"
 #include "SignatureMatcher.h"
+#include "GoPclntab.h"
+#include "EhFrame.h"
 #include <QObject>
 #include <QThread>
 #include <QAtomicInt>
@@ -53,7 +55,7 @@ private:
     void BuildBasicBlocks(AnalyzedFunction& Func, const QList<AnalyzedInstruction>& Insns);
     void ComputeDominance(AnalyzedFunction& Func);
     void DetectLoops(AnalyzedFunction& Func);
-    void ComputeFunctionBoundaryCFG(AnalyzedFunction& Func, const QSet<Address>& OtherFuncStarts);
+    void ComputeFunctionBoundaryCFG(AnalyzedFunction& Func, const QSet<Address>& OtherFuncStarts, Address Limit);
     CallingConvention DetectCallingConvention(const QList<AnalyzedInstruction>& Insns, bool Is64Bit);
     int ComputeStackFrameEquation(const QList<AnalyzedInstruction>& Insns, const QList<BasicBlock>& Blocks);
     int DetectArgCount(const QList<AnalyzedInstruction>& Insns, bool Is64Bit, CallingConvention Conv);
@@ -102,6 +104,12 @@ private:
     QAtomicInt TotalDisasmMT;
 
     SignatureMatcher SigMatcher;
+    GoPclntabInfo GoTable;
+    EhFrameInfo EhFrame;
+    DebugInfo Dwarf;
+    // Indirect jump address -> resolved jump-table targets (in table order).
+    // Written by ResolveJumpTables, read by boundary/basic-block passes.
+    QHash<Address, QVector<Address>> JumpTableTargets;
 
     QElapsedTimer AnalysisTimer;
     QString CurrentSectionName;

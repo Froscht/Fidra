@@ -1,4 +1,9 @@
 #include "Optimizer.h"
+#include <QSet>
+#include "../analysis/TypeLibrary.h"
+
+#include <QHash>
+#include <cstdint>
 
 namespace Fidra::Decomp {
 
@@ -38,25 +43,6 @@ bool Optimizer::OperandMatches(const IrOperand& A, const IrOperand& B) {
     return A == B;
 }
 
-bool Optimizer::IsDefUsed(const IrOperand& Def, const IrBasicBlock& Block, int DefIdx) {
-    for (int I = DefIdx + 1; I < Block.Instructions.size(); ++I) {
-        const IrInst& Inst = Block.Instructions[I];
-        if (OperandMatches(Inst.Src1, Def) || OperandMatches(Inst.Src2, Def)) return true;
-        if (OperandMatches(Inst.Dest, Def)) return false;
-    }
-    return true;
-}
-
-bool Optimizer::IsDefUsedInAnyBlock(const IrOperand& Def, const IrFunction& Func, int DefBlock, int DefIdx) {
-    if (IsDefUsed(Def, Func.Blocks[DefBlock], DefIdx)) return true;
-    for (int SuccId : Func.Blocks[DefBlock].Successors) {
-        for (const auto& Inst : Func.Blocks[SuccId].Instructions) {
-            if (OperandMatches(Inst.Src1, Def) || OperandMatches(Inst.Src2, Def)) return true;
-        }
-    }
-    return false;
-}
-
 IrFunction Optimizer::Optimize(const IrFunction& Func) {
     IrFunction Result = Func;
 
@@ -70,83 +56,311 @@ IrFunction Optimizer::Optimize(const IrFunction& Func) {
     if (EnabledPasses["ExpressionSimplification"]) RunExpressionSimplification(Result);
     if (EnabledPasses["ConditionRecovery"]) RunConditionRecovery(Result);
     if (EnabledPasses["DeadCodeElimination"]) RunDeadCodeElimination(Result);
+    RunParameterRecovery(Result);
 
     return Result;
 }
 
-void Optimizer::RunDeadCodeElimination(IrFunction& Func) {
-    for (auto& Block : Func.Blocks) {
-        QVector<IrInst> Kept;
-        for (int I = 0; I < Block.Instructions.size(); ++I) {
-            const IrInst& Inst = Block.Instructions[I];
+// --- Register liveness helpers -------------------------------------------
+// Registers 0..15 are the x86-64 GPRs; anything else (xmm, segment, raw
+// capstone ids) is never tracked, so its defs are never removed.
+using RegMask = uint64_t;
 
-            if (Inst.Op == IrOp::Nop) continue;
+static constexpr RegMask AllRegs = 0xFFFF;
+// Registers any call may read as arguments (SysV, Win64 and Go's ABIInternal).
+static constexpr RegMask CallArgRegs =
+    (1ull << 0) | (1ull << 1) | (1ull << 2) | (1ull << 3) | (1ull << 6) | (1ull << 7) |
+    (1ull << 8) | (1ull << 9) | (1ull << 10) | (1ull << 11);
 
-            if (Inst.Op == IrOp::Store || Inst.Op == IrOp::Call || Inst.Op == IrOp::Ret ||
-                Inst.Op == IrOp::Jump || Inst.Op == IrOp::CondJump || Inst.Op == IrOp::Compare ||
-                Inst.Op == IrOp::Test) {
-                Kept.append(Inst);
-                continue;
-            }
+static bool IsTrackedReg(const IrOperand& Op) {
+    return Op.IsReg() && Op.RegId >= 0 && Op.RegId < 16;
+}
 
-            if (!Inst.Dest.IsValid()) {
-                Kept.append(Inst);
-                continue;
-            }
+static RegMask RegBit(const IrOperand& Op) {
+    if (IsTrackedReg(Op)) return 1ull << Op.RegId;
+    if (Op.IsStack()) return 1ull << (Op.SpRelative ? 4 : 5);
+    return 0;
+}
 
-            if (Inst.Dest.IsReg() && (Inst.Dest.RegId == 4 || Inst.Dest.RegId == 5)) {
-                Kept.append(Inst);
-                continue;
-            }
-
-            if (IsDefUsedInAnyBlock(Inst.Dest, Func, Block.Id, I)) {
-                Kept.append(Inst);
-            }
-        }
-        Block.Instructions = Kept;
+static bool IsPureDef(IrOp Op) {
+    switch (Op) {
+    case IrOp::Mov: case IrOp::Add: case IrOp::Sub: case IrOp::Mul: case IrOp::Div: case IrOp::Mod:
+    case IrOp::And: case IrOp::Or: case IrOp::Xor: case IrOp::Shl: case IrOp::Shr: case IrOp::Sar:
+    case IrOp::Not: case IrOp::Neg: case IrOp::Load: case IrOp::Cast: case IrOp::SignExtend:
+    case IrOp::ZeroExtend: case IrOp::AddressOf: case IrOp::Deref:
+        return true;
+    default:
+        return false;
     }
 }
 
-void Optimizer::RunCopyPropagation(IrFunction& Func) {
-    for (int Pass = 0; Pass < 3; ++Pass) {
+// Dest is an address/target (a use), not a definition.
+static bool DestIsUse(IrOp Op) {
+    return Op == IrOp::Store || Op == IrOp::Jump || Op == IrOp::CondJump;
+}
+
+// ImplicitCallArgs: a call may read any argument register. Needed for sound
+// DCE; parameter recovery turns it off since callee arity is unknown here.
+static RegMask InstUses(const IrInst& Inst, bool ImplicitCallArgs = true) {
+    if (Inst.Op == IrOp::Unknown) return Inst.AsmRegsRead;
+    RegMask M = RegBit(Inst.Src1) | RegBit(Inst.Src2);
+    if (DestIsUse(Inst.Op)) M |= RegBit(Inst.Dest);
+    else if (Inst.Dest.IsStack()) M |= RegBit(Inst.Dest);
+    for (const IrOperand& A : Inst.CallArgs) M |= RegBit(A);  // calls and tail jumps
+    if (Inst.Op == IrOp::Call && ImplicitCallArgs && !Inst.CallArgsExact) M |= CallArgRegs;
+    return M;
+}
+
+// Registers fully overwritten by Inst. 8/16-bit writes merge into the old
+// value, so they do not kill it.
+static RegMask InstKills(const IrInst& Inst) {
+    if (Inst.Op == IrOp::Unknown) return Inst.AsmRegsKilled;
+    if (Inst.Op == IrOp::Call && !Inst.Dest.IsValid()) return 1ull << 0;  // void call: rax is garbage after it
+    if (DestIsUse(Inst.Op) || !IsTrackedReg(Inst.Dest)) return 0;
+    if (Inst.Op == IrOp::Compare || Inst.Op == IrOp::Test) return 0;
+    int Size = IrTypeSize(Inst.Dest.Type);
+    if (Size == 1 || Size == 2) return 0;
+    return 1ull << Inst.Dest.RegId;
+}
+
+// Index of the instruction whose flags feed the block's CondJump, if it is
+// an arithmetic op (cmp/test are always kept anyway). Mirrors the code
+// generator's condition lookup so DCE never removes it.
+static int FlagProducerIndex(const IrBasicBlock& Block) {
+    if (Block.Instructions.isEmpty() || Block.Instructions.last().Op != IrOp::CondJump) return -1;
+    for (int I = Block.Instructions.size() - 2; I >= 0; --I) {
+        const IrInst& Inst = Block.Instructions[I];
+        switch (Inst.Op) {
+        case IrOp::Compare: case IrOp::Test: case IrOp::Call: case IrOp::Unknown:
+            return -1;
+        case IrOp::Add: case IrOp::Sub: case IrOp::And: case IrOp::Or: case IrOp::Xor:
+        case IrOp::Shl: case IrOp::Shr: case IrOp::Sar: case IrOp::Neg: case IrOp::Mul:
+            if (Inst.Dest.IsValid()) return I;
+            break;
+        default:
+            break;
+        }
+    }
+    return -1;
+}
+
+// Backward register liveness over the CFG (GPRs only, temps are block-local).
+// Registers a call overwrites under the function's convention.
+static RegMask CallClobbers(CallingConv Conv) {
+    switch (Conv) {
+    case CallingConv::Go: return AllRegs & ~((1ull << 4) | (1ull << 5) | (1ull << 14) | (1ull << 15));
+    case CallingConv::Win64: return (1ull << 0) | (1ull << 1) | (1ull << 2) | (1ull << 8) | (1ull << 9) | (1ull << 10) | (1ull << 11);
+    default: return (1ull << 0) | (1ull << 1) | (1ull << 2) | (1ull << 6) | (1ull << 7) | (1ull << 8) | (1ull << 9) | (1ull << 10) | (1ull << 11);
+    }
+}
+
+// ImplicitCallArgs=false is the parameter-recovery view: calls read nothing
+// implicitly and overwrite the caller-saved registers.
+static void ComputeLiveness(const IrFunction& Func, QVector<RegMask>& LiveIn, QVector<RegMask>& LiveOut,
+                            bool ImplicitCallArgs = true) {
+    const RegMask Clobbers = ImplicitCallArgs ? 0 : CallClobbers(Func.Conv);
+    const int N = Func.Blocks.size();
+    QVector<RegMask> ExitLive(N, 0);
+    QVector<QVector<int>> Preds(N);
+    for (int B = 0; B < N; ++B) {
+        const IrBasicBlock& Block = Func.Blocks[B];
+        for (int S : Block.Successors)
+            if (S >= 0 && S < N) Preds[S].append(B);
+        if (!Block.Successors.isEmpty()) continue;
+        const IrInst* Last = Block.Instructions.isEmpty() ? nullptr : &Block.Instructions.last();
+        if (!Last) ExitLive[B] = AllRegs;
+        else if (Last->Op == IrOp::Ret) ExitLive[B] = 0;                     // ret reads rax explicitly
+        else if (Last->Op == IrOp::Jump) ExitLive[B] = ImplicitCallArgs ? CallArgRegs : 0;  // tail call
+        else if (Last->Op == IrOp::Call) ExitLive[B] = 0;                    // noreturn call
+        else ExitLive[B] = AllRegs;                                          // unknown end
+    }
+
+    QVector<RegMask> Gen(N, 0), Kill(N, 0);
+    for (int B = 0; B < N; ++B) {
+        RegMask G = 0, K = 0;
+        const auto& Insts = Func.Blocks[B].Instructions;
+        for (int I = Insts.size() - 1; I >= 0; --I) {
+            RegMask Kl = InstKills(Insts[I]);
+            if (Insts[I].Op == IrOp::Call) Kl |= Clobbers;
+            G &= ~Kl;
+            K |= Kl;
+            G |= InstUses(Insts[I], ImplicitCallArgs);
+        }
+        Gen[B] = G;
+        Kill[B] = K;
+    }
+
+    LiveIn.fill(0, N);
+    LiveOut.fill(0, N);
+    QVector<int> Work;
+    QVector<char> InWork(N, 1);
+    for (int B = N - 1; B >= 0; --B) Work.append(B);
+    while (!Work.isEmpty()) {
+        int B = Work.takeLast();
+        InWork[B] = 0;
+        RegMask Out = ExitLive[B];
+        for (int S : Func.Blocks[B].Successors)
+            if (S >= 0 && S < N) Out |= LiveIn[S];
+        LiveOut[B] = Out;
+        RegMask In = Gen[B] | (Out & ~Kill[B]);
+        if (In != LiveIn[B]) {
+            LiveIn[B] = In;
+            for (int P : Preds[B]) {
+                if (!InWork[P]) { InWork[P] = 1; Work.append(P); }
+            }
+        }
+    }
+}
+
+void Optimizer::RunDeadCodeElimination(IrFunction& Func) {
+    const int N = Func.Blocks.size();
+
+    for (int Round = 0; Round < 4; ++Round) {
+        QVector<RegMask> LiveIn, LiveOut;
+        ComputeLiveness(Func, LiveIn, LiveOut);
+
+        // Sweep each block backwards. Temps never cross blocks.
         bool Changed = false;
-        for (auto& Block : Func.Blocks) {
-            QMap<int, IrOperand> TempCopies;
-            QMap<int, IrOperand> RegCopies;
+        for (int B = 0; B < N; ++B) {
+            IrBasicBlock& Block = Func.Blocks[B];
+            const int Protected = FlagProducerIndex(Block);
+            RegMask Live = LiveOut[B];
+            QSet<int> LiveTemps;
+            QVector<char> Keep(Block.Instructions.size(), 1);
 
-            for (int I = 0; I < Block.Instructions.size(); ++I) {
-                IrInst& Inst = Block.Instructions[I];
+            for (int I = Block.Instructions.size() - 1; I >= 0; --I) {
+                const IrInst& Inst = Block.Instructions[I];
+                if (Inst.Op == IrOp::Nop) { Keep[I] = 0; Changed = true; continue; }
 
-                auto Substitute = [&](IrOperand& Op) {
-                    if (Op.IsTemp() && TempCopies.contains(Op.TempId)) {
-                        Op = TempCopies[Op.TempId];
-                        Changed = true;
+                bool Removable = I != Protected && IsPureDef(Inst.Op) && Inst.Dest.IsValid();
+                if (Removable) {
+                    if (Inst.Dest.IsTemp()) Removable = !LiveTemps.contains(Inst.Dest.TempId);
+                    else if (IsTrackedReg(Inst.Dest)) Removable = !(Live & (1ull << Inst.Dest.RegId));
+                    else Removable = false;
+                }
+                if (Removable) { Keep[I] = 0; Changed = true; continue; }
+
+                Live &= ~InstKills(Inst);
+                if (Inst.Dest.IsTemp() && !DestIsUse(Inst.Op)) LiveTemps.remove(Inst.Dest.TempId);
+                Live |= InstUses(Inst);
+                if (Inst.Src1.IsTemp()) LiveTemps.insert(Inst.Src1.TempId);
+                if (Inst.Src2.IsTemp()) LiveTemps.insert(Inst.Src2.TempId);
+                if (DestIsUse(Inst.Op) && Inst.Dest.IsTemp()) LiveTemps.insert(Inst.Dest.TempId);
+                for (const IrOperand& A : Inst.CallArgs)
+                    if (A.IsTemp()) LiveTemps.insert(A.TempId);
+            }
+
+            QVector<IrInst> Kept;
+            Kept.reserve(Block.Instructions.size());
+            for (int I = 0; I < Block.Instructions.size(); ++I)
+                if (Keep[I]) Kept.append(Block.Instructions[I]);
+            Block.Instructions = Kept;
+        }
+        if (!Changed) break;
+    }
+}
+
+// Register parameters = argument registers (in ABI order) read before being
+// written on entry. Lower-numbered argument registers are included too, so
+// the positions stay right when a function ignores its first argument.
+void Optimizer::RunParameterRecovery(IrFunction& Func) {
+    if (Func.Blocks.isEmpty() || Func.Conv == CallingConv::Cdecl32) return;
+    if (Func.Proto) return;  // debug info gave the real parameters
+    QVector<RegMask> LiveIn, LiveOut;
+    ComputeLiveness(Func, LiveIn, LiveOut, false);
+    int Entry = 0;
+    for (int I = 0; I < Func.Blocks.size(); ++I)
+        if (Func.Blocks[I].IsEntry) { Entry = I; break; }
+
+    const QVector<int> Order = ArgRegisterOrder(Func.Conv);
+    int Count = 0;
+    for (int I = 0; I < Order.size(); ++I)
+        if (LiveIn[Entry] & (1ull << Order[I])) Count = I + 1;
+
+    QVector<IrOperand> Params;
+    for (int I = 0; I < Count; ++I) Params.append(IrOperand::MakeReg(Order[I], IrType::Int64));
+    for (const IrOperand& P : Func.Parameters)
+        if (P.IsStack()) Params.append(P);
+    Func.Parameters = Params;
+}
+
+int Optimizer::RegisterParameterCount(const IrFunction& Func) {
+    if (Func.Blocks.isEmpty() || Func.Conv == CallingConv::Cdecl32) return 0;
+    QVector<RegMask> LiveIn, LiveOut;
+    ComputeLiveness(Func, LiveIn, LiveOut, false);
+    int Entry = 0;
+    for (int I = 0; I < Func.Blocks.size(); ++I)
+        if (Func.Blocks[I].IsEntry) { Entry = I; break; }
+    const QVector<int> Order = ArgRegisterOrder(Func.Conv);
+    int Count = 0;
+    for (int I = 0; I < Order.size(); ++I)
+        if (LiveIn[Entry] & (1ull << Order[I])) Count = I + 1;
+    return Count;
+}
+
+void Optimizer::RunCopyPropagation(IrFunction& Func) {
+    for (auto& Block : Func.Blocks) {
+        // Temp -> the non-temp value it was copied from, valid until that
+        // value may have changed.
+        QHash<int, IrOperand> TempCopies;
+
+        auto InvalidateIf = [&](auto Pred) {
+            for (auto It = TempCopies.begin(); It != TempCopies.end();) {
+                if (Pred(It.value())) It = TempCopies.erase(It);
+                else ++It;
+            }
+        };
+
+        for (int Idx = 0; Idx < Block.Instructions.size(); ++Idx) {
+            IrInst& Inst = Block.Instructions[Idx];
+            // cmp/test operands are read again at the block's conditional
+            // jump, so a copy is only usable if its source survives until then.
+            auto SurvivesToBlockEnd = [&](const IrOperand& V) {
+                if (Inst.Op != IrOp::Compare && Inst.Op != IrOp::Test) return true;
+                if (!V.IsReg()) return !V.IsStack();
+                for (int J = Idx + 1; J < Block.Instructions.size(); ++J) {
+                    const IrInst& M = Block.Instructions[J];
+                    if (M.Op == IrOp::Unknown || M.Op == IrOp::Call) return false;
+                    if (!DestIsUse(M.Op) && M.Dest.IsReg() && M.Dest.RegId == V.RegId) return false;
+                }
+                return true;
+            };
+            auto Substitute = [&](IrOperand& Op) {
+                if (Op.IsTemp()) {
+                    auto It = TempCopies.constFind(Op.TempId);
+                    if (It != TempCopies.constEnd() && SurvivesToBlockEnd(It.value())) {
+                        IrType Keep = Op.Type;
+                        Op = It.value();
+                        if (Keep != IrType::Unknown && Op.OpKind != IrOperand::Imm) Op.Type = Keep;
                     }
-                };
+                }
+            };
+            Substitute(Inst.Src1);
+            Substitute(Inst.Src2);
+            if (DestIsUse(Inst.Op)) Substitute(Inst.Dest);
+            for (IrOperand& A : Inst.CallArgs) Substitute(A);
 
-                Substitute(Inst.Src1);
-                Substitute(Inst.Src2);
-
-                if (Inst.Op == IrOp::Mov && Inst.Dest.IsTemp() && !Inst.Src1.IsTemp()) {
+            // Effects of this instruction on recorded copies.
+            if (Inst.Op == IrOp::Store || Inst.Op == IrOp::Call || Inst.Op == IrOp::Unknown) {
+                InvalidateIf([](const IrOperand& V) { return V.IsStack() || V.OpKind == IrOperand::Global; });
+            }
+            if (Inst.Op == IrOp::Call || Inst.Op == IrOp::Unknown) {
+                InvalidateIf([](const IrOperand& V) { return V.IsReg(); });
+            }
+            if (!DestIsUse(Inst.Op) && Inst.Dest.IsReg()) {
+                const int R = Inst.Dest.RegId;
+                InvalidateIf([R](const IrOperand& V) { return V.IsReg() && V.RegId == R; });
+                // rsp/rbp moves change what stack slots refer to.
+                if (R == 4 || R == 5) InvalidateIf([](const IrOperand& V) { return V.IsStack(); });
+            }
+            if (!DestIsUse(Inst.Op) && Inst.Dest.IsTemp()) {
+                TempCopies.remove(Inst.Dest.TempId);
+                if (Inst.Op == IrOp::Mov && !Inst.Src1.IsTemp() && Inst.Src1.IsValid() &&
+                    Inst.Src1.OpKind != IrOperand::Mem) {
                     TempCopies[Inst.Dest.TempId] = Inst.Src1;
-                }
-
-                if (Inst.Op == IrOp::Store || Inst.Op == IrOp::Call) {
-                    RegCopies.clear();
-                }
-
-                if (Inst.Dest.IsTemp()) {
-                    QVector<int> ToRemove;
-                    for (auto It = TempCopies.begin(); It != TempCopies.end(); ++It) {
-                        if (It.value().IsTemp() && It.value().TempId == Inst.Dest.TempId) {
-                            ToRemove.append(It.key());
-                        }
-                    }
-                    for (int Key : ToRemove) TempCopies.remove(Key);
                 }
             }
         }
-        if (!Changed) break;
     }
 }
 
@@ -189,32 +403,26 @@ void Optimizer::RunStackVariableRecovery(IrFunction& Func) {
         for (const auto& Inst : Block.Instructions) {
             auto CheckOp = [&](const IrOperand& Op, bool IsWrite) {
                 if (!Op.IsStack()) return;
-                int Off = Op.StackOffset;
-                if (!Func.StackVars.contains(Off)) {
+                int Key = StackKey(Op);
+                if (!Func.StackVars.contains(Key)) {
                     StackVariable Var;
-                    Var.Offset = Off;
+                    Var.Offset = Op.StackOffset;
+                    Var.SpRelative = Op.SpRelative;
                     Var.Type = Op.Type;
                     Var.Size = IrTypeSize(Op.Type);
                     Var.AccessCount = 1;
-                    if (Off < 0) {
-                        Var.Name = QString("Local_%1").arg(-Off, 0, 16);
-                    } else if (Off >= 8) {
-                        Var.Name = QString("Arg_%1").arg((Off - 16) / 8);
-                    } else {
-                        Var.Name = QString("Var_%1").arg(Off, 0, 16);
-                    }
-                    Func.StackVars[Off] = Var;
+                    Var.Name = StackVarName(Op.StackOffset, Op.SpRelative);
+                    Func.StackVars[Key] = Var;
                 } else {
-                    Func.StackVars[Off].AccessCount++;
-                    if (IsWrite && Func.StackVars[Off].Type == IrType::Unknown) {
-                        Func.StackVars[Off].Type = Op.Type;
-                        Func.StackVars[Off].Size = IrTypeSize(Op.Type);
+                    StackVariable& Var = Func.StackVars[Key];
+                    Var.AccessCount++;
+                    if (IsWrite && Var.Type == IrType::Unknown) {
+                        Var.Type = Op.Type;
+                        Var.Size = IrTypeSize(Op.Type);
                     }
                 }
             };
 
-            if (Inst.Op == IrOp::Store) CheckOp(Inst.Dest, true);
-            if (Inst.Op == IrOp::Load) CheckOp(Inst.Src1, false);
             CheckOp(Inst.Src1, false);
             CheckOp(Inst.Src2, false);
             CheckOp(Inst.Dest, Inst.Op == IrOp::Store);
@@ -338,7 +546,25 @@ void Optimizer::RunConstantPropagation(IrFunction& Func) {
             for (int I = 0; I < Block.Instructions.size(); ++I) {
                 IrInst& Inst = Block.Instructions[I];
 
-                if (Inst.Op == IrOp::Call) {
+                for (IrOperand& A : Inst.CallArgs) {
+                    if (A.IsTemp() && KnownTemps.contains(A.TempId)) {
+                        A = IrOperand::MakeImm(KnownTemps[A.TempId], A.Type);
+                        Changed = true;
+                    } else if (A.IsReg() && KnownRegs.contains(A.RegId)) {
+                        A = IrOperand::MakeImm(KnownRegs[A.RegId], A.Type);
+                        Changed = true;
+                    }
+                }
+                if (Inst.Op == IrOp::Call || Inst.Op == IrOp::Unknown) {
+                    for (IrOperand& A : Inst.CallArgs) {
+                        if (A.IsTemp() && KnownTemps.contains(A.TempId)) {
+                            A = IrOperand::MakeImm(KnownTemps[A.TempId], A.Type);
+                            Changed = true;
+                        } else if (A.IsReg() && KnownRegs.contains(A.RegId)) {
+                            A = IrOperand::MakeImm(KnownRegs[A.RegId], A.Type);
+                            Changed = true;
+                        }
+                    }
                     KnownRegs.clear();
                     if (Inst.Dest.IsTemp()) {
                         KnownTemps.remove(Inst.Dest.TempId);
@@ -367,6 +593,12 @@ void Optimizer::RunConstantPropagation(IrFunction& Func) {
 
                 SubstituteOperand(Inst.Src1);
                 SubstituteOperand(Inst.Src2);
+
+                if (Inst.Dest.IsReg() && (IrTypeSize(Inst.Dest.Type) == 1 || IrTypeSize(Inst.Dest.Type) == 2)) {
+                    // Partial register write: the full value is no longer a known constant.
+                    KnownRegs.remove(Inst.Dest.RegId);
+                    continue;
+                }
 
                 if (Inst.Op == IrOp::Mov && Inst.Src1.IsImm()) {
                     if (Inst.Dest.IsTemp()) {
@@ -499,7 +731,7 @@ void Optimizer::RunTypeRecovery(IrFunction& Func) {
     auto MarkPointer = [&](const IrOperand& Op) {
         if (Op.IsTemp()) RecordTemp(Op.TempId, IrType::Pointer);
         else if (Op.IsReg()) RecordReg(Op.RegId, IrType::Pointer);
-        else if (Op.IsStack()) RecordStack(Op.StackOffset, IrType::Pointer);
+        else if (Op.IsStack()) RecordStack(StackKey(Op), IrType::Pointer);
     };
 
     for (const auto& Block : Func.Blocks) {
@@ -517,13 +749,13 @@ void Optimizer::RunTypeRecovery(IrFunction& Func) {
             if (Inst.Op == IrOp::Store) {
                 MarkPointer(Inst.Dest);
                 if (Inst.Src1.IsStack()) {
-                    RecordStack(Inst.Src1.StackOffset, Inst.Src1.Type);
+                    RecordStack(StackKey(Inst.Src1), Inst.Src1.Type);
                 }
             }
 
             if (Inst.Op == IrOp::Load) {
                 if (Inst.Src1.IsStack()) {
-                    RecordStack(Inst.Src1.StackOffset, Inst.Src1.Type);
+                    RecordStack(StackKey(Inst.Src1), Inst.Src1.Type);
                 }
                 if (Inst.Dest.IsTemp() && Inst.Src1.Type != IrType::Unknown) {
                     RecordTemp(Inst.Dest.TempId, Inst.Src1.Type);
@@ -546,7 +778,15 @@ void Optimizer::RunTypeRecovery(IrFunction& Func) {
                 }
             }
 
-            if (Inst.Op == IrOp::Call && !Inst.CallName.isEmpty()) {
+            if (Inst.Op == IrOp::Call && Inst.CallProto) {
+                // Argument and return types straight from the prototype.
+                for (int K = 0; K < Inst.CallArgs.size() && K < Inst.CallProto->Params.size(); ++K) {
+                    const IrOperand& A = Inst.CallArgs[K];
+                    const IrType T = IrTypeFromCType(Inst.CallProto->Params[K].Type);
+                    if (A.IsTemp()) RecordTemp(A.TempId, T);
+                    else if (A.IsStack()) RecordStack(StackKey(A), T);
+                }
+            } else if (Inst.Op == IrOp::Call && !Inst.CallName.isEmpty()) {
                 if (KnownSignatures.contains(Inst.CallName)) {
                     const auto& ParamTypes = KnownSignatures[Inst.CallName];
 
@@ -560,7 +800,7 @@ void Optimizer::RunTypeRecovery(IrFunction& Func) {
                                 if (Prev.Src1.IsTemp()) {
                                     RecordTemp(Prev.Src1.TempId, ParamTypes[ArgIdx]);
                                 } else if (Prev.Src1.IsStack()) {
-                                    RecordStack(Prev.Src1.StackOffset, ParamTypes[ArgIdx]);
+                                    RecordStack(StackKey(Prev.Src1), ParamTypes[ArgIdx]);
                                 }
                                 RecordReg(Prev.Dest.RegId, ParamTypes[ArgIdx]);
                                 ArgIdx++;
@@ -605,7 +845,7 @@ void Optimizer::RunTypeRecovery(IrFunction& Func) {
                 if (!Op.IsStack()) return;
                 int Size = IrTypeSize(Op.Type);
                 if (Size > 0) {
-                    StackAccessSizes[Op.StackOffset][Size]++;
+                    StackAccessSizes[StackKey(Op)][Size]++;
                 }
             };
             CheckStackConsistency(Inst.Src1);
@@ -637,14 +877,15 @@ void Optimizer::RunTypeRecovery(IrFunction& Func) {
                     Op.Type = TempTypes[Op.TempId];
                 } else if (Op.IsReg() && RegTypes.contains(Op.RegId)) {
                     Op.Type = RegTypes[Op.RegId];
-                } else if (Op.IsStack() && StackTypes.contains(Op.StackOffset)) {
-                    Op.Type = StackTypes[Op.StackOffset];
+                } else if (Op.IsStack() && StackTypes.contains(StackKey(Op))) {
+                    Op.Type = StackTypes[StackKey(Op)];
                 }
             };
 
             ApplyType(Inst.Dest);
             ApplyType(Inst.Src1);
             ApplyType(Inst.Src2);
+            for (IrOperand& A : Inst.CallArgs) ApplyType(A);
         }
     }
 
@@ -664,58 +905,99 @@ void Optimizer::RunTypeRecovery(IrFunction& Func) {
 void Optimizer::RunPrologueEpilogueCleanup(IrFunction& Func) {
     if (Func.Blocks.isEmpty()) return;
 
-    auto& EntryBlock = Func.Blocks[0];
-    QVector<IrInst> Cleaned;
-    int SkipPrologue = 0;
+    auto IsRsp = [](const IrOperand& Op) { return Op.IsReg() && Op.RegId == 4; };
+    auto IsRbp = [](const IrOperand& Op) { return Op.IsReg() && Op.RegId == 5; };
+    auto IsRspAdjust = [&](const IrInst& Inst) {
+        return (Inst.Op == IrOp::Sub || Inst.Op == IrOp::Add) && IsRsp(Inst.Dest) && IsRsp(Inst.Src1) && Inst.Src2.IsImm();
+    };
 
-    for (int I = 0; I < EntryBlock.Instructions.size(); ++I) {
-        const IrInst& Inst = EntryBlock.Instructions[I];
+    auto IsPrologue = [&](const IrInst& Inst) {
+        if (IsRspAdjust(Inst)) return true;
+        if (Inst.Op == IrOp::Store && IsRsp(Inst.Dest) && Inst.Src1.IsReg()) return true;  // push reg
+        return IsRbp(Inst.Dest) && IsRsp(Inst.Src1) && (Inst.Op == IrOp::Mov || (Inst.Op == IrOp::Add && Inst.Src2.IsImm()));
+    };
+    auto IsEpilogue = [&](const IrInst& Inst) {
+        if (IsRspAdjust(Inst)) return true;
+        if (Inst.Op == IrOp::Load && Inst.Dest.IsReg() && IsRsp(Inst.Src1)) return true;  // pop reg
+        return IsRsp(Inst.Dest) && IsRbp(Inst.Src1) && (Inst.Op == IrOp::Mov || (Inst.Op == IrOp::Add && Inst.Src2.IsImm()));
+    };
+    // Instructions the scheduler may interleave with the prologue/epilogue:
+    // no control flow, no stack access, no rsp.
+    auto TouchesStack = [&](const IrInst& Inst) {
+        if (Inst.Op == IrOp::Call || Inst.Op == IrOp::Ret || Inst.Op == IrOp::Jump || Inst.Op == IrOp::CondJump ||
+            Inst.Op == IrOp::Unknown)
+            return true;
+        for (const IrOperand* Op : {&Inst.Dest, &Inst.Src1, &Inst.Src2})
+            if (IsRsp(*Op) || (Op->IsStack() && Op->SpRelative)) return true;
+        return false;
+    };
+    auto Writes = [](const IrInst& Inst, int Reg) {
+        return Inst.Op != IrOp::Store && Inst.Op != IrOp::Compare && Inst.Op != IrOp::Test &&
+               Inst.Dest.IsReg() && Inst.Dest.RegId == Reg;
+    };
+    auto Reads = [](const IrInst& Inst, int Reg) {
+        if ((Inst.Src1.IsReg() && Inst.Src1.RegId == Reg) || (Inst.Src2.IsReg() && Inst.Src2.RegId == Reg)) return true;
+        if ((Inst.Op == IrOp::Store || Inst.Op == IrOp::Compare || Inst.Op == IrOp::Test) && Inst.Dest.IsReg() && Inst.Dest.RegId == Reg) return true;
+        for (const IrOperand& A : Inst.CallArgs)
+            if (A.IsReg() && A.RegId == Reg) return true;
+        return false;
+    };
 
-        if (I < 3) {
-            if (Inst.Op == IrOp::Sub && Inst.Dest.IsReg() && Inst.Dest.RegId == 4 &&
-                Inst.Src1.IsReg() && Inst.Src1.RegId == 4 && Inst.Src2.IsImm()) {
-                SkipPrologue++;
+    // Entry: register saves (push = sub rsp, 8 + store [rsp]), frame setup
+    // (mov rbp, rsp / lea rbp, [rsp+N]) and the stack allocation, possibly
+    // interleaved with unrelated register moves. A push of a register the
+    // function already changed is a real store, not a save.
+    {
+        auto& Entry = Func.Blocks[0].Instructions;
+        QVector<int> Drop;
+        QSet<int> Written;
+        for (int I = 0; I < Entry.size(); ++I) {
+            const IrInst& Inst = Entry[I];
+            if (Inst.Op == IrOp::Nop) continue;
+            if (IsPrologue(Inst)) {
+                if (Inst.Op == IrOp::Store && Written.contains(Inst.Src1.RegId)) break;
+                if (IsRbp(Inst.Dest)) {
+                    if (Written.contains(5)) break;
+                    Func.UsesFramePointer = true;
+                }
+                Drop << I;
                 continue;
             }
-            if (Inst.Op == IrOp::Store && Inst.Dest.IsReg() && Inst.Dest.RegId == 4 &&
-                Inst.Src1.IsReg() && Inst.Src1.RegId == 5) {
-                SkipPrologue++;
-                continue;
-            }
-            if (Inst.Op == IrOp::Mov && Inst.Dest.IsReg() && Inst.Dest.RegId == 5 &&
-                Inst.Src1.IsReg() && Inst.Src1.RegId == 4) {
-                Func.UsesFramePointer = true;
-                SkipPrologue++;
-                continue;
-            }
+            if (TouchesStack(Inst)) break;
+            if (Inst.Dest.IsReg() && Writes(Inst, Inst.Dest.RegId)) Written.insert(Inst.Dest.RegId);
         }
-        Cleaned.append(Inst);
+        for (int K = Drop.size() - 1; K >= 0; --K) Entry.remove(Drop[K]);
     }
-    if (SkipPrologue > 0) EntryBlock.Instructions = Cleaned;
 
+    // Exits: the mirror image before the terminator — rsp restore
+    // (add rsp / mov rsp, rbp / lea rsp, [rbp+N]) and pops (load reg, [rsp]).
+    // A pop whose register is read afterwards is a real load and stays.
     for (auto& Block : Func.Blocks) {
-        if (!Block.IsExit) continue;
-        QVector<IrInst> CleanedExit;
-        for (int I = 0; I < Block.Instructions.size(); ++I) {
-            const IrInst& Inst = Block.Instructions[I];
-
-            if (I >= Block.Instructions.size() - 4) {
-                if (Inst.Op == IrOp::Mov && Inst.Dest.IsReg() && Inst.Dest.RegId == 4 &&
-                    Inst.Src1.IsReg() && Inst.Src1.RegId == 5) {
-                    continue;
+        auto& Insts = Block.Instructions;
+        const bool TailJump = !Insts.isEmpty() && Insts.last().Op == IrOp::Jump && Block.Successors.isEmpty();
+        if (!Block.IsExit && !TailJump) continue;
+        int End = static_cast<int>(Insts.size());
+        while (End > 0 && (Insts[End - 1].Op == IrOp::Ret || Insts[End - 1].Op == IrOp::Jump ||
+                           Insts[End - 1].Op == IrOp::Nop))
+            --End;
+        if (End == static_cast<int>(Insts.size())) continue;  // no ret / tail jump: not an epilogue
+        QVector<int> Drop;
+        for (int I = End - 1; I >= 0; --I) {
+            const IrInst& Inst = Insts[I];
+            if (Inst.Op == IrOp::Nop) continue;
+            if (IsEpilogue(Inst)) {
+                if (Inst.Op == IrOp::Load) {
+                    bool UsedLater = false;
+                    for (int J = I + 1; J < Insts.size() && !UsedLater; ++J)
+                        if (!Drop.contains(J) && Reads(Insts[J], Inst.Dest.RegId)) UsedLater = true;
+                    if (UsedLater) break;
                 }
-                if (Inst.Op == IrOp::Load && Inst.Dest.IsReg() && Inst.Dest.RegId == 5 &&
-                    Inst.Src1.IsReg() && Inst.Src1.RegId == 4) {
-                    continue;
-                }
-                if (Inst.Op == IrOp::Add && Inst.Dest.IsReg() && Inst.Dest.RegId == 4 &&
-                    Inst.Src1.IsReg() && Inst.Src1.RegId == 4 && Inst.Src2.IsImm()) {
-                    continue;
-                }
+                Drop << I;
+                continue;
             }
-            CleanedExit.append(Inst);
+            if (TouchesStack(Inst)) break;
         }
-        Block.Instructions = CleanedExit;
+        for (int K : Drop) Insts.remove(K);  // descending order
     }
 }
 

@@ -162,6 +162,8 @@ struct ExportEntry {
     uint32_t Rva;
     bool IsForwarder;
     QString ForwarderName;
+    size_t Size = 0;          // ELF st_size (0 if unknown)
+    bool IsFunction = false;  // ELF STT_FUNC
 };
 
 struct BinaryInfo {
@@ -183,6 +185,8 @@ struct BinaryInfo {
     QList<Segment> Segments;
     QList<ImportEntry> Imports;
     QList<ExportEntry> Exports;
+    // Non-exported function symbols (ELF .symtab LOCAL FUNC: statics, .isra/.cold clones).
+    QList<ExportEntry> LocalFunctions;
 };
 
 struct AnalysisProgress {

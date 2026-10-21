@@ -9,12 +9,14 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QFileInfo>
+#include <QDir>
 #include <QElapsedTimer>
 #include <cstring>
 #include <cstdio>
 
 #include "../analysis/AnalysisEngine.h"
 #include "../analysis/AnalysisDatabase.h"
+#include "../analysis/LibrarySignatures.h"
 
 #include "../disasm/DisasmModule.h"
 #include "../debugger/DebuggerModule.h"
@@ -27,6 +29,9 @@
 #include "../structeditor/StructEditorModule.h"
 #include "../diff/DiffModule.h"
 #include "../decompiler/DecompilerModule.h"
+#include "../decompiler/Lifter.h"
+#include "../decompiler/Optimizer.h"
+#include "../decompiler/CodeGenerator.h"
 #include "../callgraph/CallGraphModule.h"
 #include "../plugins/PluginModule.h"
 #include "../bindiff/BinDiffModule.h"
@@ -59,6 +64,10 @@ static void PrintUsage() {
     printf("  --output-imports <file>    Export import table\n");
     printf("  --timeout <seconds>        Analysis timeout (default: 300)\n");
     printf("  --script <lua_file>        Run Lua script after analysis\n");
+    printf("  --decompile <addr|name,...> Print pseudo-C for these functions (\"all\" = every function)\n");
+    printf("  --sigs <file|dir>          Also apply these library signatures (.fsig)\n");
+    printf("  --make-sigs <file>         Write library signatures for the binary's named functions\n");
+    printf("  --sig-module <name>        Module name stored in --make-sigs output (default: file name)\n");
     printf("\n");
     printf("General options:\n");
     printf("  --help, -h                 Show this help\n");
@@ -96,7 +105,11 @@ static QString FindBinaryPath(int Argc, char* Argv[]) {
         QStringLiteral("--output-xrefs"),
         QStringLiteral("--output-imports"),
         QStringLiteral("--timeout"),
-        QStringLiteral("--script")
+        QStringLiteral("--script"),
+        QStringLiteral("--sigs"),
+        QStringLiteral("--make-sigs"),
+        QStringLiteral("--sig-module"),
+        QStringLiteral("--decompile")
     };
 
     for (int I = 1; I < Argc; ++I) {
@@ -305,6 +318,17 @@ static int RunHeadless(int Argc, char* Argv[]) {
     QString OutputXrefsPath = FindArgValue(Argc, Argv, QStringLiteral("--output-xrefs"));
     QString OutputImportsPath = FindArgValue(Argc, Argv, QStringLiteral("--output-imports"));
     QString ScriptPath = FindArgValue(Argc, Argv, QStringLiteral("--script"));
+    QString DecompileList = FindArgValue(Argc, Argv, QStringLiteral("--decompile"));
+    QString MakeSigsPath = FindArgValue(Argc, Argv, QStringLiteral("--make-sigs"));
+    QString SigModule = FindArgValue(Argc, Argv, QStringLiteral("--sig-module"));
+    QString ExtraSigs = FindArgValue(Argc, Argv, QStringLiteral("--sigs"));
+    if (!ExtraSigs.isEmpty()) {
+        // The analysis worker reads $FIDRA_SIG_PATH when matching signatures.
+        QString SigPath = QFileInfo(ExtraSigs).absoluteFilePath();
+        const QString Existing = qEnvironmentVariable("FIDRA_SIG_PATH");
+        if (!Existing.isEmpty()) SigPath += QDir::listSeparator() + Existing;
+        qputenv("FIDRA_SIG_PATH", SigPath.toLocal8Bit());
+    }
 
     QString TimeoutStr = FindArgValue(Argc, Argv, QStringLiteral("--timeout"));
     int TimeoutSeconds = 300;
@@ -398,6 +422,47 @@ static int RunHeadless(int Argc, char* Argv[]) {
                 StdOut << "done (" << Db->FunctionCount() << " functions)\n" << Qt::flush;
             } else {
                 StdErr << "FAILED to write " << OutputFunctionsPath << "\n" << Qt::flush;
+                OutputOk = false;
+            }
+        }
+
+        if (!DecompileList.isEmpty()) {
+            QList<Fidra::Address> Targets;
+            if (DecompileList == QStringLiteral("all")) {
+                for (const auto& F : Db->GetAllFunctions()) Targets << F.Start;
+                std::sort(Targets.begin(), Targets.end());
+            } else {
+                QHash<QString, Fidra::Address> ByName;
+                for (const auto& F : Db->GetAllFunctions()) ByName.insert(F.Name, F.Start);
+                for (const QString& Item : DecompileList.split(',', Qt::SkipEmptyParts)) {
+                    bool Ok = false;
+                    const Fidra::Address Addr = Item.trimmed().toULongLong(&Ok, 16);
+                    if (Ok) Targets << Addr;
+                    else if (ByName.contains(Item.trimmed())) Targets << ByName.value(Item.trimmed());
+                    else StdErr << "Unknown function: " << Item << "\n" << Qt::flush;
+                }
+            }
+            for (Fidra::Address Addr : Targets) {
+                const Fidra::AnalyzedFunction Func = Db->GetFunctionContaining(Addr);
+                if (Func.Start == 0 && Func.End == 0) continue;
+                Fidra::Decomp::Lifter Lft;
+                Fidra::Decomp::Optimizer Opt;
+                Fidra::Decomp::CodeGenerator Gen;
+                const auto Out = Gen.Generate(Opt.Optimize(Lft.LiftFunction(Func, Db)), Db);
+                StdOut << "// ---- " << Func.Name << " @ 0x" << QString::number(Func.Start, 16) << "\n"
+                       << Out.PseudoC << "\n" << Qt::flush;
+            }
+        }
+
+        if (!MakeSigsPath.isEmpty()) {
+            StdOut << "Writing library signatures to " << MakeSigsPath << "... " << Qt::flush;
+            const QString Module = SigModule.isEmpty() ? BinaryFile.completeBaseName() : SigModule;
+            const auto Entries = Fidra::LibrarySignatures::Generate(Db, Module);
+            QString Message;
+            if (Fidra::LibrarySignatures::Save(MakeSigsPath, Entries, Db->GetBinaryInfo().Is64Bit, Module, &Message)) {
+                StdOut << "done (" << Message << ")\n" << Qt::flush;
+            } else {
+                StdErr << "FAILED to write " << MakeSigsPath << ": " << Message << "\n" << Qt::flush;
                 OutputOk = false;
             }
         }

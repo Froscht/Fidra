@@ -387,7 +387,7 @@ QString DataInspector::FormatUtf8() const {
         if (Ch.isPrint())
             Result.append(Ch);
         else
-            Result.append(QString("\\u%1").arg(Ch.unicode(), 4, 16, QChar('0')));
+            Result.append(QString("\\u%1").arg(static_cast<uint>(Ch.unicode()), 4, 16, QChar('0')));
     }
     Result.append('"');
     return Result;

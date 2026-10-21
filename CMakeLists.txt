@@ -58,6 +58,12 @@ set(LIEF_TESTS OFF CACHE BOOL "" FORCE)
 
 FetchContent_MakeAvailable(LIEF)
 
+# LIEF 0.15.1 headers use uint32_t etc. without <cstdint>; GCC 13+ no longer
+# pulls it in transitively. Force-include it for LIEF and its consumers.
+if(NOT MSVC)
+    target_compile_options(LIB_LIEF PUBLIC $<$<COMPILE_LANGUAGE:CXX>:-include cstdint>)
+endif()
+
 set(FIDRA_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/include)
 
 option(FIDRA_ENABLE_LIBDECOMP "Build libdecomp submodule as alternate decompiler backend" OFF)

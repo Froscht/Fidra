@@ -28,9 +28,27 @@ void AnalysisDatabase::Clear() {
     Strings.clear();
     Names.clear();
     Comments.clear();
+    DebugFunctions.clear();
     SortedSegments.clear();
     SortedInsnAddrs.clear();
     InsnIndexBuilt = false;
+}
+
+void AnalysisDatabase::SetDebugFunction(const DebugFunction& Func) {
+    QWriteLocker Locker(&Lock);
+    DebugFunctions.insert(Func.Low, Func);
+}
+
+std::optional<DebugFunction> AnalysisDatabase::GetDebugFunction(Address Start) const {
+    QReadLocker Locker(&Lock);
+    auto It = DebugFunctions.constFind(Start);
+    if (It == DebugFunctions.constEnd()) return std::nullopt;
+    return It.value();
+}
+
+int AnalysisDatabase::DebugFunctionCount() const {
+    QReadLocker Locker(&Lock);
+    return static_cast<int>(DebugFunctions.size());
 }
 
 void AnalysisDatabase::SetBinaryInfo(const BinaryInfo& Info) {
@@ -480,6 +498,7 @@ void AnalysisDatabase::ImportFromJson(const QJsonObject& Root) {
     ItemTypes.clear();
     Names.clear();
     Comments.clear();
+    DebugFunctions.clear();
     SortedSegments.clear();
     SortedInsnAddrs.clear();
     InsnIndexBuilt = false;

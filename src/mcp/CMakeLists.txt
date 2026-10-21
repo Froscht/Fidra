@@ -30,6 +30,7 @@ target_include_directories(fidra_mcp PRIVATE
 )
 
 target_link_libraries(fidra_mcp PRIVATE
+    fidra_analysis
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets

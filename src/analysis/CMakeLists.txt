@@ -6,6 +6,18 @@ set(ANALYSIS_SOURCES
     AnalysisEngine.cpp
     SignatureMatcher.h
     SignatureMatcher.cpp
+    GoPclntab.h
+    GoPclntab.cpp
+    EhFrame.h
+    EhFrame.cpp
+    LibrarySignatures.h
+    LibrarySignatures.cpp
+    TypeLibrary.h
+    TypeLibrary.cpp
+    TypeLibraryData.cpp
+    DwarfInfo.h
+    DwarfInfo.cpp
+    PdbInfo.cpp
     IdaShim.cpp
     InstructionStore.h
     InstructionStore.cpp

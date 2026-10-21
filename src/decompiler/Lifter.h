@@ -4,6 +4,7 @@
 #include "../analysis/AnalysisTypes.h"
 #include "../analysis/AnalysisDatabase.h"
 #include <capstone/capstone.h>
+#include <QHash>
 
 namespace Fidra::Decomp {
 
@@ -24,8 +25,17 @@ private:
     void LiftInstruction(cs_insn* Insn, const cs_detail* Detail, IrBasicBlock& Block);
     CondCode MapCondCode(unsigned int CsId);
     void BuildBlockGraph(IrFunction& Func, const AnalyzedFunction& SrcFunc);
+    void BindCallArguments(IrFunction& Func);
+    void PinConditionOperands(IrFunction& Func);
+    bool IsNoReturnCall(const IrInst& Inst) const;
+    std::shared_ptr<const FuncPrototype> FindPrototype(Address Target, const QString& Name);
+    QHash<Address, std::shared_ptr<const FuncPrototype>> DebugProtos;  // per LiftFunction call
 
     int NextTemp;
+    // Lift direct callees to count their parameters (off for those nested lifts).
+    bool ResolveCalleeArity = true;
+    QHash<Address, int> CalleeArity;  // per LiftFunction call
+    Address CurrentInsnEnd = 0;
     bool Is64Bit;
     const AnalysisDatabase* CurrentDb;
     csh CsHandle;
