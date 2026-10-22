@@ -5,7 +5,14 @@
   "description": "Fidra - Open-Source Reverse Engineering IDE",
   "homepage": "https://github.com/user/fidra",
   "dependencies": [
-    "capstone",
+    {
+      "name": "capstone",
+      "features": [
+        "x86",
+        "arm",
+        "arm64"
+      ]
+    },
     "nlohmann-json"
   ],
   "builtin-baseline": "b5d1a94fb7f88fd835e360fd23a45a09ceedbf48"

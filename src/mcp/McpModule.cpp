@@ -57,11 +57,13 @@ void McpModule::Initialize(ICore* Core) {
         Core->Log(Message, LogLevel::Info);
     });
 
-    // Auto-start the TCP server so external MCP clients can connect out of
-    // the box. Auto-picks a free port starting at 3333 — multiple Fidra
-    // sessions running in parallel each get their own endpoint.
     if (!Server->StartTcpAuto(3333, 100)) {
-        Core->Log(QStringLiteral("MCP: auto-start failed, no free port in 3333..3432"),
+        Core->Log(QStringLiteral("MCP: TCP auto-start failed, no free port in 3333..3432"),
+                  LogLevel::Warning);
+    }
+
+    if (!Server->StartSseAuto(3334, 100)) {
+        Core->Log(QStringLiteral("MCP: SSE auto-start failed, no free port in 3334..3433"),
                   LogLevel::Warning);
     }
 }
@@ -69,6 +71,7 @@ void McpModule::Initialize(ICore* Core) {
 void McpModule::Shutdown() {
     if (Server) {
         Server->StopTcp();
+        Server->StopSse();
         Server->StopStdio();
     }
     CoreRef = nullptr;

@@ -7,8 +7,10 @@
 #include <QTcpSocket>
 #include <QList>
 #include <QMap>
+#include <QSet>
 #include <QSocketNotifier>
 #include <QTimer>
+#include <QUuid>
 
 namespace Fidra {
 
@@ -31,12 +33,16 @@ public:
     McpToolRegistry* GetToolRegistry() const;
 
     bool StartTcp(uint16_t Port = 3333);
-    // Auto-pick a free port starting at StartPort, incrementing up to MaxAttempts
-    // times. Lets multiple Fidra sessions run simultaneously without clashing.
     bool StartTcpAuto(uint16_t StartPort = 3333, int MaxAttempts = 100);
     void StopTcp();
     bool IsTcpRunning() const;
     uint16_t TcpPort() const;
+
+    bool StartSse(uint16_t Port = 3334);
+    bool StartSseAuto(uint16_t StartPort = 3334, int MaxAttempts = 100);
+    void StopSse();
+    bool IsSseRunning() const;
+    uint16_t SsePort() const;
 
     void StartStdio();
     void StopStdio();
@@ -59,6 +65,8 @@ public:
 signals:
     void TcpStarted(uint16_t Port);
     void TcpStopped();
+    void SseStarted(uint16_t Port);
+    void SseStopped();
     void ClientConnected(const QString& Address);
     void ClientDisconnected(const QString& Address);
     void RequestReceived(const QString& ClientAddress, const QString& Method);
@@ -69,6 +77,9 @@ private slots:
     void OnNewConnection();
     void OnClientData();
     void OnClientDisconnected();
+    void OnNewSseConnection();
+    void OnSseClientData();
+    void OnSseClientDisconnected();
 
 private:
     void ProcessRequests(McpClientInfo& Client);
@@ -81,11 +92,13 @@ private:
 
     void SendResponse(QTcpSocket* Socket, const QByteArray& Data);
     void SendStdioResponse(const QByteArray& Data);
+    void SendSseEvent(QTcpSocket* SseSocket, const QString& Event, const QByteArray& Data);
 
     void AddLogEntry(const QString& ClientAddress, const QString& Method,
                      const QJsonValue& Params, const QJsonValue& Response, bool IsError);
 
     void ReadStdin();
+    void HandleSseHttp(QTcpSocket* Socket);
 
     QTcpServer* TcpServerInstance;
     QMap<QTcpSocket*, McpClientInfo> Clients;
@@ -94,6 +107,12 @@ private:
     bool StdioActive;
     QSocketNotifier* StdinNotifier;
     McpProtocol StdioProtocol;
+
+    QTcpServer* SseServerInstance;
+    QMap<QTcpSocket*, QByteArray> SseBuffers;
+    QMap<QString, QTcpSocket*> SseSessions;
+    QMap<QTcpSocket*, QString> SseSocketToSession;
+    QSet<QTcpSocket*> SseStreamSockets;
 
     QList<RequestLogEntry> RequestLog;
     static constexpr int MaxLogEntries = 500;

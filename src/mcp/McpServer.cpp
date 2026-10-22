@@ -19,6 +19,7 @@ McpServer::McpServer(QObject* Parent)
     , ToolRegistryRef(nullptr)
     , StdioActive(false)
     , StdinNotifier(nullptr)
+    , SseServerInstance(nullptr)
     , Initialized(false)
     , ServerName(QStringLiteral("Fidra MCP Server"))
     , ServerVersion(QStringLiteral("1.0.0")) {
@@ -26,6 +27,7 @@ McpServer::McpServer(QObject* Parent)
 
 McpServer::~McpServer() {
     StopTcp();
+    StopSse();
     StopStdio();
 }
 
@@ -129,6 +131,283 @@ void McpServer::StopStdio() {
 
 bool McpServer::IsStdioRunning() const {
     return StdioActive;
+}
+
+bool McpServer::StartSse(uint16_t Port) {
+    if (SseServerInstance && SseServerInstance->isListening())
+        return true;
+
+    if (!SseServerInstance) {
+        SseServerInstance = new QTcpServer(this);
+        connect(SseServerInstance, &QTcpServer::newConnection, this, &McpServer::OnNewSseConnection);
+    }
+
+    if (!SseServerInstance->listen(QHostAddress::LocalHost, Port)) {
+        emit LogMessage(QStringLiteral("Failed to start SSE server on port ") +
+                        QString::number(Port) + QStringLiteral(": ") +
+                        SseServerInstance->errorString());
+        return false;
+    }
+
+    emit LogMessage(QStringLiteral("MCP SSE server started on port ") + QString::number(Port));
+    emit SseStarted(Port);
+    return true;
+}
+
+bool McpServer::StartSseAuto(uint16_t StartPort, int MaxAttempts) {
+    if (SseServerInstance && SseServerInstance->isListening()) return true;
+    for (int I = 0; I < MaxAttempts; ++I) {
+        uint16_t P = static_cast<uint16_t>(StartPort + I);
+        if (StartSse(P)) return true;
+    }
+    emit LogMessage(QStringLiteral("MCP SSE: no free port in range %1..%2")
+                    .arg(StartPort).arg(StartPort + MaxAttempts - 1));
+    return false;
+}
+
+void McpServer::StopSse() {
+    if (!SseServerInstance) return;
+
+    for (QTcpSocket* Socket : SseStreamSockets)
+        Socket->close();
+    for (auto It = SseBuffers.begin(); It != SseBuffers.end(); ++It)
+        It.key()->close();
+
+    SseStreamSockets.clear();
+    SseSessions.clear();
+    SseSocketToSession.clear();
+    SseBuffers.clear();
+
+    SseServerInstance->close();
+    emit LogMessage(QStringLiteral("MCP SSE server stopped"));
+    emit SseStopped();
+}
+
+bool McpServer::IsSseRunning() const {
+    return SseServerInstance && SseServerInstance->isListening();
+}
+
+uint16_t McpServer::SsePort() const {
+    if (SseServerInstance && SseServerInstance->isListening())
+        return SseServerInstance->serverPort();
+    return 0;
+}
+
+void McpServer::OnNewSseConnection() {
+    while (SseServerInstance->hasPendingConnections()) {
+        QTcpSocket* Socket = SseServerInstance->nextPendingConnection();
+        SseBuffers.insert(Socket, QByteArray());
+
+        connect(Socket, &QTcpSocket::readyRead, this, &McpServer::OnSseClientData);
+        connect(Socket, &QTcpSocket::disconnected, this, &McpServer::OnSseClientDisconnected);
+    }
+}
+
+void McpServer::OnSseClientData() {
+    QTcpSocket* Socket = qobject_cast<QTcpSocket*>(sender());
+    if (!Socket) return;
+
+    if (SseStreamSockets.contains(Socket))
+        return;
+
+    if (!SseBuffers.contains(Socket))
+        return;
+
+    SseBuffers[Socket].append(Socket->readAll());
+    HandleSseHttp(Socket);
+}
+
+void McpServer::OnSseClientDisconnected() {
+    QTcpSocket* Socket = qobject_cast<QTcpSocket*>(sender());
+    if (!Socket) return;
+
+    if (SseSocketToSession.contains(Socket)) {
+        QString SessionId = SseSocketToSession.take(Socket);
+        SseSessions.remove(SessionId);
+        emit LogMessage(QStringLiteral("SSE session disconnected: ") + SessionId);
+    }
+
+    SseStreamSockets.remove(Socket);
+    SseBuffers.remove(Socket);
+    Socket->deleteLater();
+}
+
+void McpServer::HandleSseHttp(QTcpSocket* Socket) {
+    QByteArray& Buf = SseBuffers[Socket];
+
+    int HeaderEnd = Buf.indexOf("\r\n\r\n");
+    if (HeaderEnd < 0) return;
+
+    QByteArray HeaderSection = Buf.left(HeaderEnd);
+    int FirstLineEnd = HeaderSection.indexOf("\r\n");
+    QByteArray RequestLine = (FirstLineEnd >= 0) ? HeaderSection.left(FirstLineEnd) : HeaderSection;
+    QList<QByteArray> Parts = RequestLine.split(' ');
+    if (Parts.size() < 2) {
+        Socket->close();
+        return;
+    }
+
+    QByteArray Method = Parts[0];
+    QByteArray FullPath = Parts[1];
+
+    int ContentLength = 0;
+    QByteArray Headers = HeaderSection.mid(FirstLineEnd + 2);
+    for (const QByteArray& Line : Headers.split('\n')) {
+        QByteArray Trimmed = Line.trimmed();
+        if (Trimmed.toLower().startsWith("content-length:"))
+            ContentLength = Trimmed.mid(Trimmed.indexOf(':') + 1).trimmed().toInt();
+    }
+
+    int BodyStart = HeaderEnd + 4;
+
+    if (Method == "POST" && Buf.size() < BodyStart + ContentLength)
+        return;
+
+    QByteArray Body = (Method == "POST") ? Buf.mid(BodyStart, ContentLength) : QByteArray();
+    Buf.remove(0, BodyStart + ((Method == "POST") ? ContentLength : 0));
+
+    int QueryIdx = FullPath.indexOf('?');
+    QByteArray Path = (QueryIdx >= 0) ? FullPath.left(QueryIdx) : FullPath;
+    QByteArray Query = (QueryIdx >= 0) ? FullPath.mid(QueryIdx + 1) : QByteArray();
+
+    if (Method == "OPTIONS") {
+        QByteArray Resp = "HTTP/1.1 204 No Content\r\n"
+                          "Access-Control-Allow-Origin: *\r\n"
+                          "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+                          "Access-Control-Allow-Headers: Content-Type\r\n"
+                          "\r\n";
+        Socket->write(Resp);
+        Socket->flush();
+        Socket->close();
+        return;
+    }
+
+    if (Method == "GET" && Path == "/sse") {
+        QString SessionId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+
+        SseSessions.insert(SessionId, Socket);
+        SseSocketToSession.insert(Socket, SessionId);
+        SseStreamSockets.insert(Socket);
+        SseBuffers.remove(Socket);
+
+        QByteArray SseHeaders = "HTTP/1.1 200 OK\r\n"
+                                "Content-Type: text/event-stream\r\n"
+                                "Cache-Control: no-cache\r\n"
+                                "Connection: keep-alive\r\n"
+                                "Access-Control-Allow-Origin: *\r\n"
+                                "\r\n";
+        Socket->write(SseHeaders);
+        Socket->flush();
+
+        QByteArray EndpointUrl = QStringLiteral("/message?sessionId=%1").arg(SessionId).toUtf8();
+        SendSseEvent(Socket, QStringLiteral("endpoint"), EndpointUrl);
+
+        emit LogMessage(QStringLiteral("SSE session opened: ") + SessionId);
+        emit ClientConnected(QStringLiteral("sse:") + SessionId);
+        return;
+    }
+
+    if (Method == "POST" && Path == "/message") {
+        QString SessionId;
+        for (const QByteArray& Param : Query.split('&')) {
+            int Eq = Param.indexOf('=');
+            if (Eq > 0 && Param.left(Eq) == "sessionId")
+                SessionId = QString::fromUtf8(Param.mid(Eq + 1));
+        }
+
+        if (SessionId.isEmpty() || !SseSessions.contains(SessionId)) {
+            QByteArray Resp = "HTTP/1.1 404 Not Found\r\n"
+                              "Content-Type: text/plain\r\n"
+                              "Content-Length: 20\r\n"
+                              "Access-Control-Allow-Origin: *\r\n"
+                              "\r\n"
+                              "Session not found.\r\n";
+            Socket->write(Resp);
+            Socket->flush();
+            Socket->close();
+            return;
+        }
+
+        QTcpSocket* SseSocket = SseSessions.value(SessionId);
+
+        QJsonParseError ParseErr;
+        QJsonDocument Doc = QJsonDocument::fromJson(Body, &ParseErr);
+        if (ParseErr.error != QJsonParseError::NoError || !Doc.isObject()) {
+            QByteArray Resp = "HTTP/1.1 400 Bad Request\r\n"
+                              "Content-Type: text/plain\r\n"
+                              "Content-Length: 16\r\n"
+                              "Access-Control-Allow-Origin: *\r\n"
+                              "\r\n"
+                              "Invalid JSON.\r\n";
+            Socket->write(Resp);
+            Socket->flush();
+            Socket->close();
+            return;
+        }
+
+        auto Req = McpProtocol::ParseRequest(Doc.object());
+        if (!Req.has_value()) {
+            QByteArray Resp = "HTTP/1.1 400 Bad Request\r\n"
+                              "Content-Type: text/plain\r\n"
+                              "Content-Length: 22\r\n"
+                              "Access-Control-Allow-Origin: *\r\n"
+                              "\r\n"
+                              "Invalid JSON-RPC.\r\n";
+            Socket->write(Resp);
+            Socket->flush();
+            Socket->close();
+            return;
+        }
+
+        QString ClientAddr = QStringLiteral("sse:") + SessionId;
+        emit RequestReceived(ClientAddr, Req->Method);
+
+        if (!Req->IsNotification) {
+            JsonRpcResponse Response = HandleRequest(Req.value());
+            QByteArray ResponseJson = McpProtocol::SerializeResponse(Response);
+
+            AddLogEntry(ClientAddr, Req->Method, Req->Params,
+                        Response.IsError ? QJsonValue(Response.Error) : Response.Result,
+                        Response.IsError);
+
+            SendSseEvent(SseSocket, QStringLiteral("message"), ResponseJson);
+            emit ResponseSent(ClientAddr, Req->Method, Response.IsError);
+        } else {
+            HandleRequest(Req.value());
+        }
+
+        QByteArray Resp = "HTTP/1.1 202 Accepted\r\n"
+                          "Content-Length: 0\r\n"
+                          "Access-Control-Allow-Origin: *\r\n"
+                          "\r\n";
+        Socket->write(Resp);
+        Socket->flush();
+        Socket->close();
+        return;
+    }
+
+    QByteArray Resp = "HTTP/1.1 404 Not Found\r\n"
+                      "Content-Type: text/plain\r\n"
+                      "Content-Length: 10\r\n"
+                      "\r\n"
+                      "Not found\n";
+    Socket->write(Resp);
+    Socket->flush();
+    Socket->close();
+}
+
+void McpServer::SendSseEvent(QTcpSocket* SseSocket, const QString& Event, const QByteArray& Data) {
+    if (!SseSocket || SseSocket->state() != QAbstractSocket::ConnectedState) return;
+
+    QByteArray Frame;
+    Frame.append("event: ");
+    Frame.append(Event.toUtf8());
+    Frame.append("\ndata: ");
+    Frame.append(Data);
+    Frame.append("\n\n");
+
+    SseSocket->write(Frame);
+    SseSocket->flush();
 }
 
 QList<McpClientInfo> McpServer::GetConnectedClients() const {

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "fidra": {
+      "type": "sse",
+      "url": "http://localhost:3334/sse"
+    }
+  }
+}
